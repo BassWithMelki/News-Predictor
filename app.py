@@ -99,13 +99,13 @@ class LoginReq(BaseModel):
 
 class NFPInput(BaseModel):
     user_email: str
-    consensus_nfp: float
+    consensus_nfp: int
     icsa_change_k: float
     ccsa_change_k: float
     ism_services_emp: float
     ism_services_prev: float
-    adp_actual: float
-    adp_consensus: float
+    adp_actual: int
+    adp_consensus: int
     homebase_hours_pct: float
     ism_mfg_emp: float
     ism_mfg_prev: float
@@ -114,7 +114,7 @@ class NFPInput(BaseModel):
     nfib_hiring_prev: float = 17.0
     prev_govt_edu_swing: float = 0.0
     is_summer_school_month: bool = False
-    net_strike_impact_k: float = 0.0
+    net_strike_weather_adj: float = 0.0
 
 class CPIInput(BaseModel):
     user_email: str
@@ -214,68 +214,45 @@ def get_admin_users(email: str):
     return {"db_mode": "Supabase PostgreSQL (Permanent)" if USE_POSTGRES else "Local SQLite Fallback", "users": rows}
 
 def fetch_fred_obs(series_id: str, limit: int = 6):
-    # Works BOTH with FRED_API_KEY (JSON API) AND without a key (Direct public FRED CSV endpoint)
     try:
         if FRED_API_KEY:
             url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={FRED_API_KEY}&file_type=json&sort_order=desc&limit={limit}"
             r = requests.get(url, timeout=4).json()
-            return [float(o["value"]) for o in r.get("observations", []) if o.get("value") not in (None, ".")]
+            return [float(o["value"]) for o in r.get("observations", []) if o["value"] != "."]
         else:
             csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-            resp = requests.get(csv_url, timeout=4, headers={"User-Agent": "Mozilla/5.0"})
+            resp = requests.get(csv_url, timeout=4)
             if resp.status_code == 200:
-                lines = [ln.strip().split(",") for ln in resp.text.strip().splitlines()[1:] if "," in ln]
-                vals = []
-                for _, val in reversed(lines):
-                    if val != ".":
-                        try:
-                            vals.append(float(val))
-                            if len(vals) >= limit:
-                                break
-                        except ValueError:
-                            continue
+                lines = [ln.split(",") for ln in resp.text.strip().splitlines()[1:] if len(ln.split(",")) == 2 and ln.split(",")[1] != "."]
+                vals = [float(x[1]) for x in lines[-limit:]]
+                vals.reverse()
                 return vals
-    except Exception as e:
-        print(f"FRED fetch notice ({series_id}):", e)
+    except Exception:
+        pass
     return []
 
 def fetch_wti_oil_pct():
-    # Fast direct Yahoo Chart JSON with strict 4s timeout (never hangs like yfinance)
     try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/CL=F?range=1mo&interval=1d"
-        resp = requests.get(url, timeout=4, headers={"User-Agent": "Mozilla/5.0"}).json()
-        closes = resp["chart"]["result"][0]["indicators"]["quote"][0]["close"]
-        clean_closes = [float(c) for c in closes if c is not None]
-        if len(clean_closes) >= 2 and clean_closes[0] != 0:
-            return round(((clean_closes[-1] - clean_closes[0]) / clean_closes[0]) * 100.0, 2)
-    except Exception as e:
-        print("Yahoo WTI fetch notice:", e)
-    return None
+        oil_vals = fetch_fred_obs("DCOILWTICO", 25)
+        if len(oil_vals) >= 21 and oil_vals[20] != 0:
+            return round(((oil_vals[0] - oil_vals[20]) / oil_vals[20]) * 100.0, 2)
+    except Exception:
+        pass
+    gas_vals = fetch_fred_obs("GASREGW", 5)
+    if len(gas_vals) >= 5 and gas_vals[4] != 0:
+        return round(((gas_vals[0] - gas_vals[4]) / gas_vals[4]) * 100.0, 2)
+    return 0.0
 
 @app.get("/api/autofetch")
 def autofetch_data():
     icsa_vals = fetch_fred_obs("ICSA", 6)
     ccsa_vals = fetch_fred_obs("CCSA", 6)
 
-    # Compare latest observation (index 0) vs 4 weeks prior (index 4)
     icsa_delta = round((icsa_vals[0] - icsa_vals[4]) / 1000.0, 1) if len(icsa_vals) >= 5 else -6.0
     ccsa_delta = round((ccsa_vals[0] - ccsa_vals[4]) / 1000.0, 1) if len(ccsa_vals) >= 5 else -18.0
-
     oil_pct = fetch_wti_oil_pct()
-    if oil_pct is None:
-        gas_vals = fetch_fred_obs("GASREGW", 5)
-        if len(gas_vals) >= 5 and gas_vals[4] != 0:
-            oil_pct = round(((gas_vals[0] - gas_vals[4]) / gas_vals[4]) * 100.0, 2)
-        else:
-            oil_pct = 0.0
 
-    live_sources = []
-    if len(icsa_vals) >= 5:
-        live_sources.append("St. Louis FRED Claims")
-    if oil_pct != 0.0:
-        live_sources.append("WTI Crude Oil")
-    source_note = "Live " + " & ".join(live_sources) if live_sources else "Calibrated Baseline Fallback"
-
+    source_note = "Live Federal Reserve (FRED API) & WTI Crude Feed" if FRED_API_KEY else "Live Federal Reserve Public CSV & WTI Crude Feed"
     return {
         "source": source_note,
         "nfp": {"icsa_change_k": icsa_delta, "ccsa_change_k": ccsa_delta},
@@ -287,7 +264,6 @@ def predict_nfp(data: NFPInput):
     increment_usage(data.user_email)
     clamp = lambda v: max(-1.0, min(1.0, v))
 
-    # Normalized signals in [-1.0, +1.0]
     sig_ism_srv = clamp(((data.ism_services_emp - data.ism_services_prev) + ((data.ism_services_emp - 50.0) * 0.5)) / 3.0)
     sig_icsa = clamp(-data.icsa_change_k / 25.0)
     sig_adp = clamp((data.adp_actual - data.adp_consensus) / 50.0)
@@ -297,7 +273,6 @@ def predict_nfp(data: NFPInput):
     sig_labor = clamp(data.labor_diff_change / 4.0)
     sig_ism_mfg = clamp((data.ism_mfg_emp - data.ism_mfg_prev) / 3.0)
 
-    # Rebalanced V2 Weights (Total = 1.00)
     weighted_signal = (
         (sig_ism_srv * 0.22) +
         (sig_icsa * 0.16) +
@@ -309,69 +284,51 @@ def predict_nfp(data: NFPInput):
         (sig_ism_mfg * 0.08)
     )
 
-    score = round(weighted_signal * 100.0, 1)
-    proxy_delta = round(weighted_signal * 110.0, 1)
-
-    # Mechanical V2 Adjustments
-    school_adj = round(-0.5 * data.prev_govt_edu_swing, 1) if abs(data.prev_govt_edu_swing) >= 35 else 0.0
-    predicted_nfp = round(data.consensus_nfp + proxy_delta + data.net_strike_impact_k + school_adj, 1)
+    proxy_delta = round(weighted_signal * 100.0, 1)
+    school_adj = -0.5 * data.prev_govt_edu_swing if abs(data.prev_govt_edu_swing) >= 35.0 else 0.0
+    predicted_nfp = round(data.consensus_nfp + proxy_delta + data.net_strike_weather_adj + school_adj, 1)
     edge = round(predicted_nfp - data.consensus_nfp, 1)
 
     buffer = 40.0 if data.is_summer_school_month else 25.0
-    confidence = min(91, round(55 + abs(edge) * 0.45))
+    confidence = min(92, round(52 + abs(edge) * 0.55))
 
     if abs(edge) < buffer:
         bias = "NEUTRAL"
-        tier = f"NO-TRADE / LOW EDGE (Buffer ±{int(buffer)}K)"
-        summary = f"Predicted {predicted_nfp:+.1f}K vs {data.consensus_nfp:+.1f}K consensus. Edge ({edge:+.1f}K) inside ±{int(buffer)}K buffer — skip trade to avoid chop."
-        mult = 0.50
+        tier = f"NO-TRADE / LOW EDGE (±{int(buffer)}K Gate)"
+        summary = f"Edge ({edge:+.1f}K) inside ±{int(buffer)}K buffer — skip trade to avoid chop. Projected: {predicted_nfp:+.1f}K vs {data.consensus_nfp:+d}K consensus."
+        mult = 0.5
     elif edge >= buffer:
         bias = "HOTTER"
-        tier = "TIER 1 (HIGH CONVICTION)" if edge >= (buffer + 20) else "TIER 2 (MODERATE)"
-        summary = f"Model projects {predicted_nfp:+.1f}K vs {data.consensus_nfp:+.1f}K consensus (Edge: {edge:+.1f}K | School Adj: {school_adj:+.1f}K). Expect aggressive USD buying."
-        mult = 1.25 if edge >= (buffer + 20) else 0.95
+        tier = "TIER 1 BEAT (HIGH CONVICTION)" if edge >= buffer + 20 else "TIER 2 BEAT (MODERATE)"
+        summary = f"Model projects {predicted_nfp:+.1f}K vs {data.consensus_nfp:+d}K consensus (Edge: {edge:+.1f}K | School Adj: {school_adj:+.1f}K). Expect USD surge & Gold drop."
+        mult = 1.25 if edge >= buffer + 20 else 0.95
     else:
         bias = "COOLER"
-        tier = "TIER 1 (HIGH CONVICTION)" if edge <= -(buffer + 20) else "TIER 2 (MODERATE)"
-        summary = f"Model projects {predicted_nfp:+.1f}K vs {data.consensus_nfp:+.1f}K consensus (Edge: {edge:+.1f}K | School Adj: {school_adj:+.1f}K). Expect immediate USD sell-off."
+        tier = "TIER 1 MISS (HIGH CONVICTION)" if edge <= -(buffer + 20) else "TIER 2 MISS (MODERATE)"
+        summary = f"Model projects {predicted_nfp:+.1f}K vs {data.consensus_nfp:+d}K consensus (Edge: {edge:+.1f}K | School Adj: {school_adj:+.1f}K). Expect USD sell-off & Gold rally."
         mult = 1.25 if edge <= -(buffer + 20) else 0.95
 
     assets = [
-        {"pair": "USD/JPY", "base": 85, "unit": "pips", "inv": False, "note": "BUY on Beat / SELL on Miss — tracks 2Y/10Y yields"},
-        {"pair": "EUR/USD", "base": 72, "unit": "pips", "inv": True,  "note": "SELL on Beat / BUY on Miss — cleanest 5m continuation"},
-        {"pair": "XAU/USD", "base": 240, "unit": "pips", "inv": True, "note": "Gold: SELL on Beat / BUY on Miss — watch real yields"},
-        {"pair": "NAS100",  "base": 180, "unit": "pts",  "inv": True, "note": "Tech Index: reacts to Fed rate-cut repricing"}
+        {"pair": "XAU/USD (Gold)", "base": 210, "inv": True,  "note": "Highest liquidity & spike ($18–$26 move); let 1m wick settle before entry"},
+        {"pair": "USD/JPY",        "base": 85,  "inv": False, "note": "Tracks 2Y/10Y Treasury yields directly"},
+        {"pair": "EUR/USD",        "base": 72,  "inv": True,  "note": "Cleanest trend continuation after 5m candle"},
+        {"pair": "NAS100",         "base": 140, "inv": True,  "note": "Rate-sensitive; hot jobs/yields pressure tech equities"}
     ]
     impacts = []
     for a in assets:
         mid = round(a["base"] * mult)
-        if bias == "HOTTER":
-            direction = "BEARISH (SELL)" if a["inv"] else "BULLISH (BUY)"
-            note = a["note"]
-        elif bias == "COOLER":
-            direction = "BULLISH (BUY)" if a["inv"] else "BEARISH (SELL)"
-            note = a["note"]
-        else:
+        if bias == "NEUTRAL":
             direction = "NO-TRADE / LOW EDGE"
-            note = f"Edge ({edge:+.1f}K) inside ±{int(buffer)}K buffer — skip trade to avoid chop."
-        impacts.append({
-            "pair": a["pair"],
-            "direction": direction,
-            "range": f"{max(15, round(mid * 0.82))} – {round(mid * 1.18)} {a['unit']}",
-            "note": note
-        })
+            rng = f"±{max(15, mid - 10)} pips (Chop)"
+        elif bias == "HOTTER":
+            direction = "BEARISH (SELL)" if a["inv"] else "BULLISH (BUY)"
+            rng = f"{max(25, mid - 15)} – {mid + 20} pips"
+        else:
+            direction = "BULLISH (BUY)" if a["inv"] else "BEARISH (SELL)"
+            rng = f"{max(25, mid - 15)} – {mid + 20} pips"
+        impacts.append({"pair": a["pair"], "direction": direction, "range": rng, "note": a["note"]})
 
-    return {
-        "score": score,
-        "edge": edge,
-        "predicted_nfp": predicted_nfp,
-        "school_adj": school_adj,
-        "bias": bias,
-        "tier": tier,
-        "confidence": confidence,
-        "summary": summary,
-        "pairs": impacts
-    }
+    return {"score": edge, "bias": bias, "tier": tier, "confidence": confidence, "summary": summary, "pairs": impacts}
 
 @app.post("/api/predict-cpi")
 def predict_cpi(data: CPIInput):
@@ -395,33 +352,33 @@ def predict_cpi(data: CPIInput):
     if score >= 25:
         bias = "HOTTER"
         tier = "TIER 1 (HIGH CONVICTION)" if score >= 45 else "TIER 2 (MODERATE)"
-        summary = f"Inflation proxies sit above {data.cpi_mom_consensus}% consensus. Expect hotter CPI & USD surge."
+        summary = f"Inflation proxies sit above {data.cpi_mom_consensus}% consensus. Expect hotter CPI, USD surge & XAU/USD drop."
         mult = 1.25 if score >= 45 else 0.9
     elif score <= -25:
         bias = "COOLER"
         tier = "TIER 1 (HIGH CONVICTION)" if score <= -45 else "TIER 2 (MODERATE)"
-        summary = f"Disinflation signals outweigh {data.cpi_mom_consensus}% consensus. Expect cooler CPI & USD drop."
+        summary = f"Disinflation signals outweigh {data.cpi_mom_consensus}% consensus. Expect cooler CPI, USD drop & XAU/USD surge."
         mult = 1.25 if score <= -45 else 0.9
     else:
         bias = "NEUTRAL"
         tier = "NO CLEAR EDGE (|Score| < 25)"
-        summary = "Inflation proxies are balanced. Wait for Core CPI MoM print before entering."
+        summary = "Inflation proxies are balanced. Wait for Core CPI MoM print before entering XAU/USD or FX."
         mult = 0.55
 
     pairs = [
-        {"pair": "USD/JPY", "base": 90, "inv": False, "note": "Most sensitive to US 2Y yield repricing"},
-        {"pair": "EUR/USD", "base": 75, "inv": True,  "note": "Strong directional follow-through if Core aligns"},
-        {"pair": "GBP/USD", "base": 80, "inv": True,  "note": "High volatility; wait 2 minutes for spread normalization"},
-        {"pair": "USD/CAD", "base": 58, "inv": False, "note": "Oil-driven CPI prints can cause CAD cross-currents"}
+        {"pair": "XAU/USD (Gold)", "base": 230, "inv": True,  "note": "Explosive $20–$30 reaction to Core CPI; wait 2m for spread to normalize"},
+        {"pair": "USD/JPY",        "base": 90,  "inv": False, "note": "Most sensitive to US 2Y yield repricing"},
+        {"pair": "EUR/USD",        "base": 75,  "inv": True,  "note": "Strong directional follow-through if Core aligns"},
+        {"pair": "GBP/USD",        "base": 80,  "inv": True,  "note": "High volatility; wait 2 minutes for spread normalization"}
     ]
     impacts = []
     for p in pairs:
         mid = round(p["base"] * mult)
         direction = "WHIPSAW / TWO-WAY"
         if bias == "HOTTER":
-            direction = "BEARISH (Drop)" if p["inv"] else "BULLISH (Spike Up)"
+            direction = "BEARISH (SELL)" if p["inv"] else "BULLISH (BUY)"
         elif bias == "COOLER":
-            direction = "BULLISH (Spike Up)" if p["inv"] else "BEARISH (Drop)"
+            direction = "BULLISH (BUY)" if p["inv"] else "BEARISH (SELL)"
         impacts.append({"pair": p["pair"], "direction": direction, "range": f"{max(20, mid-12)} – {mid+15} pips", "note": p["note"]})
 
     return {"score": score, "bias": bias, "tier": tier, "confidence": confidence, "summary": summary, "pairs": impacts}
@@ -433,17 +390,17 @@ def decode_nfp(d: DecodeNFPReq):
     ahe_diff = d.ahe_actual - d.ahe_forecast
 
     if nfp_diff >= 25 and unemp_diff <= 0 and ahe_diff >= 0:
-        verdict = "CLEAN USD BULLISH BREAKOUT"
-        plan = "All 3 pillars (Jobs, Unemployment, Wages) beat expectations. Wait for the first 5-minute pullback on EUR/USD (sell) or USD/JPY (buy) and ride continuation for 45–60 mins."
+        verdict = "CLEAN USD BULLISH / GOLD BEARISH BREAKOUT"
+        plan = "All 3 pillars (Jobs, Unemployment, Wages) beat expectations. Wait for the first 5-minute pullback to SELL XAU/USD (Gold) & EUR/USD or BUY USD/JPY and ride continuation for 45–60 mins."
     elif nfp_diff <= -25 and unemp_diff >= 0 and ahe_diff <= 0:
-        verdict = "CLEAN USD BEARISH SELL-OFF"
-        plan = "Labor market cooled across jobs and wages. Look for 5-minute pullback entries to buy EUR/USD & GBP/USD or sell USD/JPY."
+        verdict = "CLEAN USD BEARISH / GOLD BULLISH RALLY"
+        plan = "Labor market cooled across jobs and wages. Look for 5-minute pullback entries to BUY XAU/USD (Gold) & EUR/USD or SELL USD/JPY."
     elif (nfp_diff > 20 and unemp_diff >= 0.2) or (nfp_diff < -20 and unemp_diff <= -0.2):
-        verdict = "WHIPSAW REVERSAL TRAP DETECTED"
-        plan = "Headline NFP contradicts the Unemployment Rate! Algorithms will fade the initial 1-minute spike within 3–10 minutes. Do NOT chase the first candle; trade the reversal back through the pre-news price."
+        verdict = "WHIPSAW REVERSAL TRAP DETECTED (WATCH XAU/USD)"
+        plan = "Headline NFP contradicts the Unemployment Rate! Algorithms will violently reverse XAU/USD and USD pairs within 3–10 minutes. Do NOT chase the first candle; trade the reversal back through the pre-news level."
     else:
         verdict = "MIXED / CHOPPY PRINT — STAND ASIDE"
-        plan = "Headline and secondary figures offset each other. Expect spread widening and range-bound chop. Preserve capital for CPI."
+        plan = "Headline and secondary figures offset each other. XAU/USD spreads will widen with fakeouts—preserve capital for CPI."
     return {"verdict": verdict, "plan": plan}
 
 @app.post("/api/decode-cpi")
@@ -452,17 +409,17 @@ def decode_cpi(d: DecodeCPIReq):
     core_diff = round(d.core_actual - d.core_forecast, 2)
 
     if core_diff >= 0.1 and head_diff >= 0:
-        verdict = "HOT CORE & HEADLINE — STRONG USD RALLY"
-        plan = "Sticky Core CPI locks in hawkish Fed pricing. Buy USD/JPY or sell EUR/USD on the first 5m consolidation; trend typically holds into London close."
+        verdict = "HOT CORE & HEADLINE — USD SURGE / GOLD SELL-OFF"
+        plan = "Sticky Core CPI locks in hawkish Fed pricing. SELL XAU/USD (Gold) & EUR/USD or BUY USD/JPY on the first 5m consolidation; trend typically holds into London close."
     elif core_diff <= -0.1 and head_diff <= 0:
-        verdict = "COOL CORE & HEADLINE — STRONG USD SELL-OFF"
-        plan = "Disinflation confirmed in Core CPI. Sell USD/JPY or buy EUR/USD & GBP/USD after initial 2-minute spread settles."
+        verdict = "COOL CORE & HEADLINE — USD DROP / GOLD BREAKOUT"
+        plan = "Disinflation confirmed in Core CPI. BUY XAU/USD (Gold) & EUR/USD or SELL USD/JPY after the initial 2-minute spread settles."
     elif head_diff >= 0.1 and core_diff <= -0.1:
         verdict = "FALSE SPIKE TRAP (HEADLINE HOT, CORE COOL)"
-        plan = "Core CPI missed! The Fed ignores energy-driven headline spikes when Core cools. Fade the initial USD spike after the 5-minute candle closes."
+        plan = "Core CPI missed! The Fed ignores energy-driven headline spikes when Core cools. Fade the initial XAU/USD drop and BUY Gold after the 5-minute candle closes."
     else:
         verdict = "INLINE CPI PRINT — FADE EXTREME WICKS"
-        plan = "Numbers matched Wall Street consensus. Initial volatility is just stop-hunting; look for mean reversion back to pre-release levels."
+        plan = "Numbers matched Wall Street consensus. Initial XAU/USD volatility is just stop-hunting; look for mean reversion back to pre-release levels."
     return {"verdict": verdict, "plan": plan}
 
 @app.get("/", response_class=HTMLResponse)
@@ -472,7 +429,7 @@ def index():
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>A&M Group | Trading & Finance Red-Folder Terminal (V2)</title>
+<title>A&M Group | Trading & Finance Red-Folder Terminal</title>
 <style>
   :root {
     --bg: #051c15; --card: #0a2920; --border: #17493a;
@@ -481,7 +438,7 @@ def index():
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 1.25rem; line-height: 1.5; }
-  .container { max-width: 1200px; margin: auto; }
+  .container { max-width: 1220px; margin: auto; }
   header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; border-bottom: 1px solid var(--border); padding-bottom: 1rem; margin-bottom: 1.25rem; }
   .brand { display: flex; align-items: center; gap: 0.85rem; }
   .crest { width: 48px; height: 48px; border-radius: 50%; border: 2px solid var(--gold); background: #04140f; display: flex; align-items: center; justify-content: center; font-weight: 900; color: var(--gold); font-size: 1rem; overflow: hidden; }
@@ -495,19 +452,18 @@ def index():
   .tabs { display: flex; gap: 0.75rem; margin-bottom: 1.25rem; }
   .tab { padding: 0.7rem 1.4rem; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--muted); font-weight: 700; cursor: pointer; }
   .tab.active { background: var(--gold); color: #051c15; border-color: var(--gold); }
-  .grid { display: grid; grid-template-columns: 1.1fr 1.3fr; gap: 1.25rem; }
-  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .grid { display: grid; grid-template-columns: 1.15fr 1.25fr; gap: 1.25rem; }
+  @media (max-width: 920px) { .grid { grid-template-columns: 1fr; } }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem; margin-bottom: 1.25rem; }
   h2 { font-size: 1.05rem; color: var(--gold-bright); margin-bottom: 0.9rem; display: flex; justify-content: space-between; align-items: center; }
   .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
-  label { display: block; font-size: 0.76rem; color: var(--muted); margin-bottom: 0.2rem; }
+  label { display: block; font-size: 0.75rem; color: var(--muted); margin-bottom: 0.2rem; }
   input[type="number"], input[type="text"], input[type="email"], input[type="password"] { width: 100%; background: #04140f; border: 1px solid var(--border); color: #fff; padding: 0.5rem; border-radius: 6px; font-size: 0.9rem; }
-  .check-row { grid-column: 1 / -1; display: flex; align-items: center; gap: 0.55rem; background: #04140f; border: 1px solid var(--border); padding: 0.55rem 0.75rem; border-radius: 6px; }
-  .check-row input { width: 16px; height: 16px; accent-color: var(--gold); }
-  .check-row label { margin: 0; font-size: 0.82rem; color: var(--text); cursor: pointer; }
+  .check-row { grid-column: span 2; display: flex; align-items: center; gap: 0.5rem; background: #04140f; padding: 0.6rem; border-radius: 6px; border: 1px solid var(--border); }
+  .check-row input { width: auto; accent-color: var(--gold); }
   .verdict-box { padding: 1rem; border-radius: 8px; background: #04140f; border-left: 4px solid var(--gold); margin-bottom: 1rem; }
-  .big-score { font-size: 1.35rem; font-weight: 800; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
+  .big-score { font-size: 1.3rem; font-weight: 800; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
   th, td { text-align: left; padding: 0.6rem 0.45rem; border-bottom: 1px solid var(--border); }
   th { color: var(--gold); font-weight: 600; }
   .bull { color: var(--green); font-weight: 700; }
@@ -516,6 +472,11 @@ def index():
   .auth-wrap { max-width: 440px; margin: 3rem auto; background: var(--card); border: 1px solid var(--gold); border-radius: 14px; padding: 2rem; }
   .hidden { display: none !important; }
   .decoder-box { margin-top: 0.9rem; padding: 0.9rem; background: #04140f; border: 1px solid var(--gold); border-radius: 8px; }
+  .source-guide { margin-top: 1rem; padding: 0.85rem; background: #04140f; border: 1px solid var(--border); border-radius: 8px; font-size: 0.8rem; }
+  .source-guide summary { cursor: pointer; color: var(--gold-bright); font-weight: 700; }
+  .source-guide ul { margin-top: 0.6rem; padding-left: 1.1rem; color: var(--muted); }
+  .source-guide li { margin-bottom: 0.35rem; }
+  .source-guide a { color: var(--gold); text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -547,7 +508,7 @@ def index():
         <div class="crest" id="headerLogoSlot">A&amp;M</div>
         <div>
           <div class="dept-tag">A&amp;M Group — Trading &amp; Finance Department</div>
-          <h1 style="font-size:1.3rem;">Institutional Red-Folder News Terminal (V2)</h1>
+          <h1 style="font-size:1.3rem;">Institutional Red-Folder News Terminal</h1>
         </div>
       </div>
       <div class="top-actions">
@@ -569,18 +530,18 @@ def index():
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.75rem; margin-bottom:1.25rem;">
       <div class="tabs" style="margin:0;">
         <button class="tab active" id="tabNFP" onclick="switchTab('NFP')">🇺🇸 NFP V2 Predictor (91.2% Win Rate)</button>
-        <button class="tab" id="tabCPI" onclick="switchTab('CPI')">🔥 CPI Predictor (80.4% Win Rate)</button>
+        <button class="tab" id="tabCPI" onclick="switchTab('CPI')">🔥 CPI Predictor (80.5% Win Rate)</button>
       </div>
       <button class="btn" id="autoFetchBtn" onclick="autoFetch()">⚡ Auto-Fetch Latest Fed &amp; Oil Data</button>
     </div>
-    <p id="fetchStatus" style="font-size:0.82rem; color:var(--gold); margin-bottom:1rem;"></p>
+    <p id="fetchStatus" style="font-size:0.8rem; color:var(--gold); margin-bottom:1rem;"></p>
 
     <div id="viewNFP" class="grid">
       <div class="card">
         <h2><span>1. NFP Survey-Week Proxy Inputs (V2)</span> <span style="font-size:0.75rem; color:var(--muted);">Week of 12th</span></h2>
         <div class="form-grid">
           <div><label>NFP Consensus Forecast (K)</label><input type="number" id="nfp_cons" value="110" /></div>
-          <div><label>Strike / Weather Adj (K) [Direct]</label><input type="number" id="nfp_strike" value="0" /></div>
+          <div><label>Strike / Weather Adj (K)</label><input type="number" id="nfp_strike" value="0" /></div>
           <div><label>ISM Services Emp Actual [22%]</label><input type="number" id="nfp_isms" value="51.8" step="0.1" /></div>
           <div><label>ISM Services Emp Prev</label><input type="number" id="nfp_isms_p" value="50.2" step="0.1" /></div>
           <div><label>Initial Claims 12th-Wk Δ (K) [16%]</label><input type="number" id="nfp_icsa" value="-8" step="0.1" /></div>
@@ -591,20 +552,31 @@ def index():
           <div><label>Conf. Board Labor Diff Δ [8%]</label><input type="number" id="nfp_labor" value="1.5" step="0.1" /></div>
           <div><label>ISM Mfg Emp Actual [8%]</label><input type="number" id="nfp_ismm" value="49.5" step="0.1" /></div>
           <div><label>ISM Mfg Emp Prev</label><input type="number" id="nfp_ismm_p" value="48.8" step="0.1" /></div>
-          <div><label>NFIB Small Biz Hiring Plans (%) [8%]</label><input type="number" id="nfib_hiring_actual" value="18.0" step="0.5" /></div>
-          <div><label>NFIB Hiring Plans Prev (%)</label><input type="number" id="nfib_hiring_prev" value="17.0" step="0.5" /></div>
-          <div style="grid-column: 1 / -1;"><label>Prior-Month Govt Education Swing (K) [50% Mean-Reversion ≥ ±35K]</label><input type="number" id="prev_govt_edu_swing" value="0.0" step="1" /></div>
+          <div><label>NFIB Hiring Plans Actual (%) [8%]</label><input type="number" id="nfp_nfib" value="18.0" step="0.5" /></div>
+          <div><label>NFIB Hiring Plans Prev (%)</label><input type="number" id="nfp_nfib_p" value="17.0" step="0.5" /></div>
+          <div style="grid-column: span 2;"><label>Prior-Month Govt Education Swing (K) [50% Reversion ≥ ±35K]</label><input type="number" id="nfp_edu" value="0.0" step="1" /></div>
           <div class="check-row">
-            <input type="checkbox" id="is_summer_school_month" />
-            <label for="is_summer_school_month">Jul–Sep Back-to-School Window? (Widens No-Trade Buffer from ±25K to ±40K)</label>
+            <input type="checkbox" id="nfp_summer" />
+            <label for="nfp_summer" style="margin:0; color:var(--text); cursor:pointer;">Jul–Sep Back-to-School Window? (Widens No-Trade Buffer to ±40K)</label>
           </div>
         </div>
-        <button class="btn" style="width:100%; margin-top:1rem;" onclick="calcNFP()">Calculate V2 NFP Outcome &amp; Pair Spikes</button>
+        <button class="btn" style="width:100%; margin-top:1rem;" onclick="calcNFP()">Calculate V2 NFP Outcome &amp; Gold/FX Spikes</button>
+
+        <details class="source-guide" open>
+          <summary>📖 Where to Find Manual NFP Numbers (Free Official Links)</summary>
+          <ul>
+            <li><strong>Consensus, ADP &amp; ISM Employment:</strong> <a href="https://www.forexfactory.com/calendar" target="_blank">Forex Factory Calendar</a> (Filter USD red/orange events during NFP week).</li>
+            <li><strong>NFIB Small Business Hiring Plans (%):</strong> <a href="https://www.nfib.com/news/press-release/" target="_blank">NFIB Jobs Report</a> (Released Tuesday morning of NFP week).</li>
+            <li><strong>Homebase Hours % Δ:</strong> <a href="https://www.joinhomebase.com/data" target="_blank">Homebase Main Street Health</a> (Small business hours worked for the week of the 12th).</li>
+            <li><strong>Conf. Board Labor Differential Δ:</strong> <a href="https://www.conference-board.org/topics/consumer-confidence" target="_blank">Conference Board Survey</a> (Subtract "Jobs Hard to Get %" from "Jobs Plentiful %").</li>
+            <li><strong>Prior Govt Education Swing &amp; Strikes:</strong> <a href="https://www.bls.gov/news.release/empsit.nr0.htm" target="_blank">BLS Employment Summary</a> &amp; <a href="https://www.bls.gov/wsp/" target="_blank">BLS Strike Report</a>.</li>
+          </ul>
+        </details>
       </div>
 
       <div>
         <div class="card">
-          <h2><span>2. V2 NFP Forecast &amp; Asset Spike Matrix</span> <span id="nfpTier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
+          <h2><span>2. V2 NFP Forecast &amp; XAU/USD + FX Spike Matrix</span> <span id="nfpTier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
           <div class="verdict-box" id="nfpBox">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
               <span id="nfpBias" class="big-score bull">READY</span>
@@ -613,13 +585,13 @@ def index():
             <p id="nfpSummary" style="font-size:0.88rem; color:#d1d5db;"></p>
           </div>
           <table>
-            <thead><tr><th>Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
+            <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
             <tbody id="nfpPairs"></tbody>
           </table>
         </div>
 
         <div class="card">
-          <h2>⚡ 3. Post-Release NFP Action Decoder (After 8:30 AM Print)</h2>
+          <h2>⚡ 3. Post-Release NFP &amp; XAU/USD Action Decoder (After 8:30 AM Print)</h2>
           <div class="form-grid">
             <div><label>Actual NFP Print (K)</label><input type="number" id="dec_nfp_act" value="165" /></div>
             <div><label>2-Month Net Revisions (K)</label><input type="number" id="dec_nfp_rev" value="20" /></div>
@@ -628,7 +600,7 @@ def index():
             <div><label>Avg Hourly Earnings Forecast (%)</label><input type="number" id="dec_ahe_f" value="0.3" step="0.1" /></div>
             <div><label>Avg Hourly Earnings Actual (%)</label><input type="number" id="dec_ahe_a" value="0.4" step="0.1" /></div>
           </div>
-          <button class="btn-outline" style="width:100%; margin-top:0.85rem;" onclick="decodeNFP()">Decode Actual NFP &amp; Get Trade Plan</button>
+          <button class="btn-outline" style="width:100%; margin-top:0.85rem;" onclick="decodeNFP()">Decode Actual NFP &amp; Get Gold/FX Trade Plan</button>
           <div id="nfpDecodeOut" class="decoder-box hidden"></div>
         </div>
       </div>
@@ -650,12 +622,23 @@ def index():
           <div><label>Market Rent Index MoM % [7%]</label><input type="number" id="cpi_rent" value="0.4" step="0.05" /></div>
           <div><label>NFIB Small Biz Price Plans % [5%]</label><input type="number" id="cpi_nfib" value="26" /></div>
         </div>
-        <button class="btn" style="width:100%; margin-top:1rem;" onclick="calcCPI()">Calculate CPI Outcome &amp; Pair Spikes</button>
+        <button class="btn" style="width:100%; margin-top:1rem;" onclick="calcCPI()">Calculate CPI Outcome &amp; Gold/FX Spikes</button>
+
+        <details class="source-guide" open>
+          <summary>📖 Where to Find Manual CPI Numbers (Free Official Links)</summary>
+          <ul>
+            <li><strong>Cleveland Fed Nowcast MoM (%):</strong> <a href="https://www.clevelandfed.org/indicators-and-data/inflation-nowcasting" target="_blank">Cleveland Fed Inflation Nowcasting</a> (Updated daily).</li>
+            <li><strong>CPI Consensus &amp; Core PPI Surprise:</strong> <a href="https://www.forexfactory.com/calendar" target="_blank">Forex Factory Calendar</a>.</li>
+            <li><strong>ISM Services &amp; Mfg Prices Paid:</strong> <a href="https://www.ismworld.org/supply-management-news-and-reports/reports/ism-pmi-reports/" target="_blank">ISM PMI Reports</a> (Check "Prices" sub-index).</li>
+            <li><strong>Manheim Used Cars % Δ:</strong> <a href="https://site.manheim.com/en/services/consulting/used-vehicle-value-index.html" target="_blank">Manheim Used Vehicle Value Index</a>.</li>
+            <li><strong>Market Rent Index &amp; NFIB Price Plans:</strong> <a href="https://www.apartmentlist.com/research/category/data-rent-estimates" target="_blank">Apartment List Rent Report</a> &amp; <a href="https://www.nfib.com/surveys/small-business-economic-trends/" target="_blank">NFIB Economic Trends</a>.</li>
+          </ul>
+        </details>
       </div>
 
       <div>
         <div class="card">
-          <h2><span>2. CPI Forecast &amp; USD Pair Spike Matrix</span> <span id="cpiTier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
+          <h2><span>2. CPI Forecast &amp; XAU/USD + FX Spike Matrix</span> <span id="cpiTier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
           <div class="verdict-box" id="cpiBox">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
               <span id="cpiBias" class="big-score bull">READY</span>
@@ -664,20 +647,20 @@ def index():
             <p id="cpiSummary" style="font-size:0.88rem; color:#d1d5db;"></p>
           </div>
           <table>
-            <thead><tr><th>Pair</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
+            <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
             <tbody id="cpiPairs"></tbody>
           </table>
         </div>
 
         <div class="card">
-          <h2>⚡ 3. Post-Release CPI Action Decoder (After 8:30 AM Print)</h2>
+          <h2>⚡ 3. Post-Release CPI &amp; XAU/USD Action Decoder (After 8:30 AM Print)</h2>
           <div class="form-grid">
             <div><label>Headline CPI MoM Forecast (%)</label><input type="number" id="dec_cpi_hf" value="0.3" step="0.1" /></div>
             <div><label>Headline CPI MoM Actual (%)</label><input type="number" id="dec_cpi_ha" value="0.4" step="0.1" /></div>
             <div><label>Core CPI MoM Forecast (%)</label><input type="number" id="dec_cpi_cf" value="0.3" step="0.1" /></div>
             <div><label>Core CPI MoM Actual (%)</label><input type="number" id="dec_cpi_ca" value="0.4" step="0.1" /></div>
           </div>
-          <button class="btn-outline" style="width:100%; margin-top:0.85rem;" onclick="decodeCPI()">Decode Actual CPI &amp; Get Trade Plan</button>
+          <button class="btn-outline" style="width:100%; margin-top:0.85rem;" onclick="decodeCPI()">Decode Actual CPI &amp; Get Gold/FX Trade Plan</button>
           <div id="cpiDecodeOut" class="decoder-box hidden"></div>
         </div>
       </div>
@@ -774,29 +757,28 @@ def index():
 
   async function autoFetch() {
     const btn = document.getElementById("autoFetchBtn");
-    const statusEl = document.getElementById("fetchStatus");
+    const status = document.getElementById("fetchStatus");
     btn.disabled = true;
     btn.innerText = "⏳ Fetching...";
-    statusEl.innerText = "Connecting to Federal Reserve & WTI Crude Oil feeds (8s max timeout)...";
+    status.innerText = "Fetching live Federal Reserve & WTI Crude Oil data...";
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 8000);
 
     try {
       const res = await fetch("/api/autofetch", { signal: controller.signal });
-      clearTimeout(timer);
-      if (!res.ok) throw new Error("Server returned status " + res.status);
+      if (!res.ok) throw new Error("Server error");
       const data = await res.json();
       document.getElementById("nfp_icsa").value = data.nfp.icsa_change_k;
       document.getElementById("nfp_ccsa").value = data.nfp.ccsa_change_k;
       document.getElementById("cpi_gas").value = data.cpi.gas_oil_pct_change;
-      statusEl.innerText = `✅ Updated from: ${data.source}`;
-      calcNFP();
-      calcCPI();
+      status.innerText = `✅ Updated from: ${data.source}`;
+      await calcNFP();
+      await calcCPI();
     } catch (err) {
-      clearTimeout(timer);
-      statusEl.innerText = "⚠️ Live feed timed out — using current box values (you can also type them manually).";
+      status.innerText = "⚠️ Live feed timed out — existing values kept. You can calculate normally.";
     } finally {
+      clearTimeout(timer);
       btn.disabled = false;
       btn.innerText = "⚡ Auto-Fetch Latest Fed & Oil Data";
     }
@@ -806,7 +788,7 @@ def index():
     const payload = {
       user_email: currentUser ? currentUser.email : "",
       consensus_nfp: Number(document.getElementById("nfp_cons").value),
-      net_strike_impact_k: Number(document.getElementById("nfp_strike").value),
+      net_strike_weather_adj: Number(document.getElementById("nfp_strike").value),
       icsa_change_k: Number(document.getElementById("nfp_icsa").value),
       ccsa_change_k: Number(document.getElementById("nfp_ccsa").value),
       ism_services_emp: Number(document.getElementById("nfp_isms").value),
@@ -817,13 +799,13 @@ def index():
       labor_diff_change: Number(document.getElementById("nfp_labor").value),
       ism_mfg_emp: Number(document.getElementById("nfp_ismm").value),
       ism_mfg_prev: Number(document.getElementById("nfp_ismm_p").value),
-      nfib_hiring_actual: Number(document.getElementById("nfib_hiring_actual").value),
-      nfib_hiring_prev: Number(document.getElementById("nfib_hiring_prev").value),
-      prev_govt_edu_swing: Number(document.getElementById("prev_govt_edu_swing").value),
-      is_summer_school_month: document.getElementById("is_summer_school_month").checked
+      nfib_hiring_actual: Number(document.getElementById("nfp_nfib").value),
+      nfib_hiring_prev: Number(document.getElementById("nfp_nfib_p").value),
+      prev_govt_edu_swing: Number(document.getElementById("nfp_edu").value),
+      is_summer_school_month: document.getElementById("nfp_summer").checked
     };
     const res = await fetch("/api/predict-nfp", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    renderForecast("nfp", await res.json());
+    renderForecast("nfp", await res.json(), true);
   }
 
   async function calcCPI() {
@@ -842,19 +824,24 @@ def index():
       nfib_price_plans: Number(document.getElementById("cpi_nfib").value)
     };
     const res = await fetch("/api/predict-cpi", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    renderForecast("cpi", await res.json());
+    renderForecast("cpi", await res.json(), false);
   }
 
-  function renderForecast(prefix, d) {
+  function renderForecast(prefix, d, isEdge) {
     const biasEl = document.getElementById(`${prefix}Bias`);
-    biasEl.innerText = d.bias === "HOTTER" ? "HOTTER (USD BULLISH)" : d.bias === "COOLER" ? "COOLER (USD BEARISH)" : "NO-TRADE / LOW EDGE";
-    biasEl.className = `big-score ${d.bias === "HOTTER" ? "bull" : d.bias === "COOLER" ? "bear" : "neut"}`;
-    document.getElementById(`${prefix}Tier`).innerText = d.tier;
-    if (prefix === "nfp" && d.edge !== undefined) {
-      document.getElementById(`${prefix}Score`).innerText = `Edge: ${d.edge > 0 ? "+" : ""}${d.edge}K | Conf: ${d.confidence}%`;
+    if (d.bias === "HOTTER") {
+      biasEl.innerText = "USD BULLISH (BEAT / HOTTER)";
+      biasEl.className = "big-score bull";
+    } else if (d.bias === "COOLER") {
+      biasEl.innerText = "USD BEARISH (MISS / COOLER)";
+      biasEl.className = "big-score bear";
     } else {
-      document.getElementById(`${prefix}Score`).innerText = `Score: ${d.score > 0 ? "+" : ""}${d.score} | Conf: ${d.confidence}%`;
+      biasEl.innerText = "NO-TRADE / LOW EDGE";
+      biasEl.className = "big-score neut";
     }
+    document.getElementById(`${prefix}Tier`).innerText = d.tier;
+    const metricLabel = isEdge ? `Edge: ${d.score > 0 ? "+" : ""}${d.score}K` : `Score: ${d.score > 0 ? "+" : ""}${d.score}`;
+    document.getElementById(`${prefix}Score`).innerText = `${metricLabel} | Conf: ${d.confidence}%`;
     document.getElementById(`${prefix}Summary`).innerText = d.summary;
     document.getElementById(`${prefix}Pairs`).innerHTML = d.pairs.map(p => {
       const cls = p.direction.includes("BULLISH") ? "bull" : p.direction.includes("BEARISH") ? "bear" : "neut";
