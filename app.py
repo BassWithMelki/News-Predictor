@@ -1,24 +1,65 @@
 import os
+import re
+import hmac
+import json
+import time
+import math
+import base64
 import hashlib
+import secrets
 import sqlite3
-from datetime import datetime
+import logging
+import threading
+from collections import defaultdict, deque
+from datetime import datetime, timezone
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import uvicorn
 
 try:
     import psycopg2
+    from psycopg2 import pool as pg_pool
     from psycopg2.extras import RealDictCursor
 except ImportError:
     psycopg2 = None
+    pg_pool = None
 
-app = FastAPI(title="A&M Group — Trading & Finance Department")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("amgroup")
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except ValueError:
+        return default
+
+# API docs are hidden by default so the endpoint list is not public. Set ENABLE_DOCS=1 to show them.
+_docs_on = os.getenv("ENABLE_DOCS", "0").strip() == "1"
+app = FastAPI(
+    title="A&M Group — Trading & Finance Department",
+    docs_url="/docs" if _docs_on else None,
+    redoc_url="/redoc" if _docs_on else None,
+    openapi_url="/openapi.json" if _docs_on else None,
+)
 
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@amgroup.com").strip().lower()
 FRED_API_KEY = os.getenv("FRED_API_KEY", "").strip()
 RAW_DB_URL = os.getenv("DATABASE_URL", "").strip()
+REQUIRE_POSTGRES = os.getenv("REQUIRE_POSTGRES", "0").strip() == "1"
+DB_POOL_MAX = max(_env_int("DB_POOL_MAX", 5), 1)
+SESSION_DAYS = 7
+COOKIE_NAME = "am_session"
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "1" if os.getenv("RENDER") else "0").strip() == "1"
+
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+SECRET_KEY_EPHEMERAL = not SECRET_KEY
+if SECRET_KEY_EPHEMERAL:
+    SECRET_KEY = secrets.token_hex(32)
+    log.warning("SECRET_KEY is not set: using a temporary key, so everyone is logged out on every restart.")
+if not os.getenv("ADMIN_EMAIL"):
+    log.warning("ADMIN_EMAIL is not set: the default admin address is publicly guessable. Set it on Render.")
 
 def get_clean_db_url():
     if not RAW_DB_URL:
@@ -26,30 +67,26 @@ def get_clean_db_url():
     url = RAW_DB_URL.replace(" ", "%20")
     if "sslmode=" not in url:
         sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}sslmode=require"
+        url = f"{url}{sep}sslmode=prefer"
     return url
 
 DATABASE_URL = get_clean_db_url()
 USE_POSTGRES = False
+DB_STATUS_MSG = "Not checked yet"
+PG_SCHEMA_READY = False
+_PG_POOL = None
+_POOL_LOCK = threading.Lock()
+_PG_NEXT_TRY = 0.0  # after a failed connect, wait a few seconds before trying again
 
-def get_db_conn():
-    global USE_POSTGRES
-    if DATABASE_URL and psycopg2 is not None:
-        try:
-            conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, connect_timeout=5)
-            USE_POSTGRES = True
-            return conn
-        except Exception as e:
-            print("Postgres fallback triggered:", e)
-    USE_POSTGRES = False
-    conn = sqlite3.connect("am_group_local.db")
-    conn.row_factory = sqlite3.Row
-    return conn
+class PoolBusy(Exception):
+    pass
 
-def init_db():
-    conn = get_db_conn()
-    cur = conn.cursor()
-    if USE_POSTGRES:
+def _first_line(err) -> str:
+    text = str(err).strip()
+    return text.splitlines()[0].strip() if text else type(err).__name__
+
+def _create_tables(cur, postgres: bool):
+    if postgres:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -75,6 +112,147 @@ def init_db():
                 last_login TEXT NOT NULL
             )
         """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS site_settings (
+            setting_key TEXT PRIMARY KEY,
+            setting_value TEXT NOT NULL
+        )
+    """)
+
+class PooledConn:
+    """Wraps a pooled Postgres connection so the existing conn.close() calls return it to the pool."""
+    def __init__(self, pool, raw):
+        self._pool = pool
+        self._raw = raw
+        self._done = False
+
+    def cursor(self, *args, **kwargs):
+        return self._raw.cursor(*args, **kwargs)
+
+    def commit(self):
+        self._raw.commit()
+
+    def rollback(self):
+        self._raw.rollback()
+
+    def close(self):
+        if self._done:
+            return
+        self._done = True
+        try:
+            self._raw.rollback()
+        except Exception:
+            pass
+        try:
+            self._pool.putconn(self._raw, close=bool(getattr(self._raw, "closed", 0)))
+        except Exception:
+            pass
+
+    def __del__(self):  # safety net: never leak a pooled connection
+        try:
+            self.close()
+        except Exception:
+            pass
+
+def is_pg(conn) -> bool:
+    return isinstance(conn, PooledConn)
+
+def ph_for(conn) -> str:
+    return "%s" if is_pg(conn) else "?"
+
+def _get_pool():
+    global _PG_POOL
+    with _POOL_LOCK:
+        if _PG_POOL is None:
+            _PG_POOL = pg_pool.ThreadedConnectionPool(
+                1, DB_POOL_MAX, DATABASE_URL, cursor_factory=RealDictCursor, connect_timeout=10
+            )
+        return _PG_POOL
+
+def _getconn_wait(pool, timeout: float = 8.0):
+    deadline = time.time() + timeout
+    while True:
+        try:
+            return pool.getconn()
+        except pg_pool.PoolError:
+            if time.time() >= deadline:
+                raise PoolBusy("all database connections are busy")
+            time.sleep(0.05)
+
+def _checkout_pg() -> PooledConn:
+    pool = _get_pool()
+    raw = _getconn_wait(pool)
+    try:  # drop connections the server has silently closed
+        probe = raw.cursor()
+        probe.execute("SELECT 1")
+        probe.close()
+        raw.rollback()
+    except Exception:
+        try:
+            pool.putconn(raw, close=True)
+        except Exception:
+            pass
+        raw = _getconn_wait(pool)
+    return PooledConn(pool, raw)
+
+def _ensure_pg_schema(conn):
+    """Create tables in Postgres once per process (covers Postgres being down at startup)."""
+    global PG_SCHEMA_READY
+    try:
+        cur = conn.cursor()
+        _create_tables(cur, True)
+        conn.commit()
+        try:
+            cur.execute(
+                "SELECT c.relname, c.relrowsecurity FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname IN ('users', 'site_settings')"
+            )
+            off = [r["relname"] for r in cur.fetchall() if not r["relrowsecurity"]]
+            if off:
+                log.warning("Row Level Security is OFF on: %s. See the README step 'Lock down Supabase'.", ", ".join(off))
+        except Exception:
+            conn.rollback()
+        cur.close()
+        PG_SCHEMA_READY = True
+    except Exception as err:
+        conn.rollback()
+        log.warning("Postgres schema notice: %s", err)
+
+def get_db_conn():
+    global USE_POSTGRES, DB_STATUS_MSG, _PG_NEXT_TRY
+    if not DATABASE_URL:
+        DB_STATUS_MSG = "Fallback: DATABASE_URL environment variable is missing or empty"
+    elif psycopg2 is None:
+        DB_STATUS_MSG = "Fallback: psycopg2 is not installed (add psycopg2-binary to requirements.txt)"
+    elif time.time() < _PG_NEXT_TRY:
+        pass  # recently failed: keep the last error message and skip the slow retry
+    else:
+        try:
+            conn = _checkout_pg()
+            USE_POSTGRES = True
+            DB_STATUS_MSG = "Supabase PostgreSQL (Permanent)"
+            _PG_NEXT_TRY = 0.0
+            if not PG_SCHEMA_READY:
+                _ensure_pg_schema(conn)
+            return conn
+        except PoolBusy:
+            raise HTTPException(status_code=503, detail="The server is busy. Please try again in a moment.")
+        except Exception as e:
+            DB_STATUS_MSG = f"Fallback: {_first_line(e)}"
+            _PG_NEXT_TRY = time.time() + 15
+            log.warning("Postgres fallback triggered: %s", e)
+    USE_POSTGRES = False
+    if REQUIRE_POSTGRES:
+        raise HTTPException(status_code=503, detail="Database temporarily unavailable. Please try again shortly.")
+    conn = sqlite3.connect("am_group_local.db")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db_conn()
+    cur = conn.cursor()
+    _create_tables(cur, is_pg(conn))
     conn.commit()
     cur.close()
     conn.close()
@@ -82,10 +260,173 @@ def init_db():
 try:
     init_db()
 except Exception as startup_err:
-    print("Startup DB notice:", startup_err)
+    log.warning("Startup DB notice: %s", startup_err)
+
+SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 15, 8, 1
+SCRYPT_MAXMEM = 64 * 1024 * 1024
+
+def _scrypt(pwd: str, salt: bytes, n: int, r: int, p: int) -> bytes:
+    return hashlib.scrypt(pwd.encode("utf-8"), salt=salt, n=n, r=r, p=p, maxmem=SCRYPT_MAXMEM, dklen=32)
 
 def hash_pwd(pwd: str) -> str:
+    """Salted scrypt hash, stored as scrypt$n$r$p$salt$hash."""
+    salt = secrets.token_bytes(16)
+    dk = _scrypt(pwd, salt, SCRYPT_N, SCRYPT_R, SCRYPT_P)
+    return "scrypt$%d$%d$%d$%s$%s" % (
+        SCRYPT_N, SCRYPT_R, SCRYPT_P,
+        base64.b64encode(salt).decode(), base64.b64encode(dk).decode(),
+    )
+
+def legacy_hash(pwd: str) -> str:
+    """The old unsalted SHA-256 format. Only used to recognise existing accounts."""
     return hashlib.sha256(pwd.encode("utf-8")).hexdigest()
+
+def verify_pwd(pwd: str, stored: str):
+    """Returns (is_correct, needs_upgrade). Old SHA-256 accounts are upgraded on their next login."""
+    if stored.startswith("scrypt$"):
+        try:
+            _, n, r, p, salt_b64, hash_b64 = stored.split("$")
+            expected = base64.b64decode(hash_b64)
+            got = _scrypt(pwd, base64.b64decode(salt_b64), int(n), int(r), int(p))
+            return hmac.compare_digest(got, expected), False
+        except Exception:
+            return False, False
+    ok = hmac.compare_digest(legacy_hash(pwd), stored)
+    return ok, ok
+
+_DUMMY_HASH = None
+
+def dummy_verify(pwd: str):
+    """Spend the same time as a real check so unknown emails cannot be detected by timing."""
+    global _DUMMY_HASH
+    if _DUMMY_HASH is None:
+        _DUMMY_HASH = hash_pwd("not-a-real-password")
+    verify_pwd(pwd, _DUMMY_HASH)
+
+def utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+# ---- signed session cookie (no extra dependencies) ----
+def _b64u(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+def _b64u_decode(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+def make_token(email: str) -> str:
+    payload = _b64u(json.dumps({"e": email, "x": int(time.time()) + SESSION_DAYS * 86400},
+                               separators=(",", ":")).encode())
+    sig = _b64u(hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).digest())
+    return f"{payload}.{sig}"
+
+def read_token(token: str):
+    try:
+        payload, sig = token.split(".", 1)
+        expected = _b64u(hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(sig, expected):
+            return None
+        data = json.loads(_b64u_decode(payload))
+        if data["x"] < time.time():
+            return None
+        return str(data["e"])
+    except Exception:
+        return None
+
+def set_session_cookie(response: Response, email: str):
+    response.set_cookie(
+        key=COOKIE_NAME, value=make_token(email), max_age=SESSION_DAYS * 86400,
+        httponly=True, samesite="lax", secure=COOKIE_SECURE, path="/",
+    )
+
+def current_user(request: Request) -> str:
+    token = request.cookies.get(COOKIE_NAME, "")
+    email = read_token(token) if token else None
+    if not email:
+        raise HTTPException(status_code=401, detail="Please log in to continue.")
+    return email
+
+def require_admin(email: str = Depends(current_user)) -> str:
+    if email != ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    return email
+
+# ---- simple in-memory rate limiter (resets on restart; fine for a single server) ----
+class RateLimiter:
+    def __init__(self):
+        self.hits = defaultdict(deque)
+        self.lock = threading.Lock()
+
+    def check(self, key: str, limit: int, window: int):
+        now = time.time()
+        with self.lock:
+            if len(self.hits) > 5000:
+                for k in [k for k, q in self.hits.items() if not q or q[-1] <= now - 3600]:
+                    del self.hits[k]
+            q = self.hits[key]
+            while q and q[0] <= now - window:
+                q.popleft()
+            if len(q) >= limit:
+                raise HTTPException(status_code=429, detail="Too many attempts. Please wait a few minutes and try again.")
+            q.append(now)
+
+    def clear(self, key: str):
+        with self.lock:
+            self.hits.pop(key, None)
+
+limiter = RateLimiter()
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[-1].strip()  # the entry added by Render's proxy
+    return request.client.host if request.client else "unknown"
+
+# ---- input checks ----
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
+PHONE_RE = re.compile(r"^\+?[0-9][0-9 ()\-]{6,19}$")
+
+def validate_registration(req):
+    full_name = req.full_name.strip()
+    email = req.email.strip().lower()
+    whatsapp = req.whatsapp.strip()
+    if not 2 <= len(full_name) <= 100:
+        raise HTTPException(status_code=400, detail="Please enter your full name (2 to 100 characters).")
+    if len(email) > 254 or not EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+    if not PHONE_RE.match(whatsapp):
+        raise HTTPException(status_code=400, detail="Please enter a valid WhatsApp number, e.g. +254700000000.")
+    if not 8 <= len(req.password) <= 128:
+        raise HTTPException(status_code=400, detail="Password must be 8 to 128 characters long.")
+    return full_name, email, whatsapp
+
+def check_numbers(model):
+    """Reject NaN, infinity and absurd values in predictor inputs."""
+    data = model.model_dump() if hasattr(model, "model_dump") else model.dict()
+    for key, value in data.items():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and (not math.isfinite(value) or abs(value) > 1_000_000):
+            raise HTTPException(status_code=422, detail=f"The value for '{key}' is out of range.")
+
+# ---- security headers on every response ----
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "same-origin",
+    "Content-Security-Policy": (
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    ),
+}
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    for name, value in SECURITY_HEADERS.items():
+        resp.headers.setdefault(name, value)
+    if COOKIE_SECURE:
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return resp
 
 class RegisterReq(BaseModel):
     full_name: str
@@ -151,7 +492,7 @@ def increment_usage(email: str):
     try:
         conn = get_db_conn()
         cur = conn.cursor()
-        ph = "%s" if USE_POSTGRES else "?"
+        ph = ph_for(conn)
         cur.execute(f"UPDATE users SET calc_count = calc_count + 1 WHERE email = {ph}", (email.lower(),))
         conn.commit()
         cur.close()
@@ -160,60 +501,150 @@ def increment_usage(email: str):
         pass
 
 @app.post("/api/register")
-def register_user(req: RegisterReq):
-    email = req.email.strip().lower()
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+def register_user(req: RegisterReq, request: Request, response: Response):
+    limiter.check(f"register-ip:{client_ip(request)}", 10, 3600)
+    full_name, email, whatsapp = validate_registration(req)
+    now = utc_stamp()
     conn = get_db_conn()
+    ph = ph_for(conn)
     cur = conn.cursor()
-    ph = "%s" if USE_POSTGRES else "?"
     try:
+        cur.execute(f"SELECT 1 FROM users WHERE email = {ph}", (email,))
+        if cur.fetchone():
+            raise HTTPException(status_code=400, detail="Email already registered. Please log in.")
         cur.execute(
             f"INSERT INTO users (full_name, email, whatsapp, password_hash, calc_count, created_at, last_login) VALUES ({ph}, {ph}, {ph}, {ph}, 0, {ph}, {ph})",
-            (req.full_name.strip(), email, req.whatsapp.strip(), hash_pwd(req.password), now, now)
+            (full_name, email, whatsapp, hash_pwd(req.password), now, now)
         )
         conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        if type(e).__name__ in ("UniqueViolation", "IntegrityError"):
+            raise HTTPException(status_code=400, detail="Email already registered. Please log in.")
+        log.exception("Registration failed")
+        raise HTTPException(status_code=500, detail="Could not create your account. Please try again.")
+    finally:
+        cur.close()
+        conn.close()
+    set_session_cookie(response, email)
+    return {"status": "ok", "full_name": full_name, "email": email, "is_admin": email == ADMIN_EMAIL}
+
+@app.post("/api/login")
+def login_user(req: LoginReq, request: Request, response: Response):
+    email = req.email.strip().lower()[:254]
+    limiter.check(f"login-ip:{client_ip(request)}", 30, 600)
+    limiter.check(f"login-email:{email}", 8, 600)
+    conn = get_db_conn()
+    ph = ph_for(conn)
+    cur = conn.cursor()
+    try:
+        cur.execute(f"SELECT * FROM users WHERE email = {ph}", (email,))
+        user = cur.fetchone()
+        if not user:
+            dummy_verify(req.password)
+            ok, upgrade = False, False
+        else:
+            ok, upgrade = verify_pwd(req.password, user["password_hash"])
+        if not ok:
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+        now = utc_stamp()
+        if upgrade:  # old SHA-256 account: store a salted scrypt hash instead
+            cur.execute(
+                f"UPDATE users SET password_hash = {ph}, last_login = {ph} WHERE email = {ph}",
+                (hash_pwd(req.password), now, email)
+            )
+        else:
+            cur.execute(f"UPDATE users SET last_login = {ph} WHERE email = {ph}", (now, email))
+        conn.commit()
+        full_name = user["full_name"]
+    finally:
+        cur.close()
+        conn.close()
+    limiter.clear(f"login-email:{email}")
+    set_session_cookie(response, email)
+    return {"status": "ok", "full_name": full_name, "email": email, "is_admin": email == ADMIN_EMAIL}
+
+@app.post("/api/logout")
+def logout_user(response: Response):
+    response.delete_cookie(COOKIE_NAME, path="/")
+    return {"status": "ok"}
+
+@app.get("/api/me")
+def whoami(email: str = Depends(current_user)):
+    return {"email": email, "is_admin": email == ADMIN_EMAIL}
+
+@app.get("/healthz")
+def healthz():
+    conn = get_db_conn()  # raises 503 when REQUIRE_POSTGRES=1 and the database is down
+    mode = "postgres" if is_pg(conn) else "fallback-sqlite"
+    conn.close()
+    return {"status": "ok", "database": mode}
+
+@app.get("/api/admin/users")
+def get_admin_users(admin: str = Depends(require_admin)):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT id, full_name, email, whatsapp, calc_count, created_at, last_login FROM users ORDER BY id DESC")
+        rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        cur.close()
+        conn.close()
+    return {"db_mode": DB_STATUS_MSG, "users": rows}
+
+class LogoReq(BaseModel):
+    email: str = ""
+    logo: str
+
+MAX_LOGO_CHARS = 3_000_000  # roughly a 2 MB image once base64-encoded
+
+@app.get("/api/logo")
+def get_logo():
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        ph = ph_for(conn)
+        cur.execute(f"SELECT setting_value FROM site_settings WHERE setting_key = {ph}", ("brand_logo",))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return {"logo": row["setting_value"] if row else ""}
     except Exception:
+        return {"logo": ""}
+
+@app.post("/api/logo")
+def save_logo(req: LogoReq, admin: str = Depends(require_admin)):
+    if not req.logo.startswith("data:image/"):
+        raise HTTPException(status_code=400, detail="Logo must be an image file.")
+    if len(req.logo) > MAX_LOGO_CHARS:
+        raise HTTPException(status_code=413, detail="Logo is too large (max about 2 MB). Please upload a smaller image.")
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        if is_pg(conn):
+            cur.execute(
+                "INSERT INTO site_settings (setting_key, setting_value) VALUES (%s, %s) "
+                "ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value",
+                ("brand_logo", req.logo)
+            )
+        else:
+            cur.execute(
+                "INSERT OR REPLACE INTO site_settings (setting_key, setting_value) VALUES (?, ?)",
+                ("brand_logo", req.logo)
+            )
+        conn.commit()
+    except Exception as e:
         conn.rollback()
         cur.close()
         conn.close()
-        raise HTTPException(status_code=400, detail="Email already registered. Please log in.")
+        raise HTTPException(status_code=500, detail=f"Could not save logo: {_first_line(e)}")
     cur.close()
     conn.close()
-    return {"status": "ok", "full_name": req.full_name.strip(), "email": email, "is_admin": email == ADMIN_EMAIL}
+    return {"status": "ok", "storage": DB_STATUS_MSG}
 
-@app.post("/api/login")
-def login_user(req: LoginReq):
-    email = req.email.strip().lower()
-    conn = get_db_conn()
-    cur = conn.cursor()
-    ph = "%s" if USE_POSTGRES else "?"
-    cur.execute(f"SELECT * FROM users WHERE email = {ph}", (email,))
-    user = cur.fetchone()
-    if not user or user["password_hash"] != hash_pwd(req.password):
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=401, detail="Invalid email or password.")
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    cur.execute(f"UPDATE users SET last_login = {ph} WHERE email = {ph}", (now, email))
-    conn.commit()
-    full_name = user["full_name"]
-    cur.close()
-    conn.close()
-    return {"status": "ok", "full_name": full_name, "email": email, "is_admin": email == ADMIN_EMAIL}
-
-@app.get("/api/admin/users")
-def get_admin_users(email: str):
-    if email.strip().lower() != ADMIN_EMAIL:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    conn = get_db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT id, full_name, email, whatsapp, calc_count, created_at, last_login FROM users ORDER BY id DESC")
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close()
-    conn.close()
-    return {"db_mode": "Supabase PostgreSQL (Permanent)" if USE_POSTGRES else "Local SQLite Fallback", "users": rows}
-
-def fetch_fred_obs(series_id: str, limit: int = 6):
+def _fetch_fred_obs_uncached(series_id: str, limit: int = 6):
     try:
         if FRED_API_KEY:
             url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={FRED_API_KEY}&file_type=json&sort_order=desc&limit={limit}"
@@ -231,6 +662,19 @@ def fetch_fred_obs(series_id: str, limit: int = 6):
         pass
     return []
 
+_FRED_CACHE = {}
+_FRED_TTL_SECONDS = 900
+
+def fetch_fred_obs(series_id: str, limit: int = 6):
+    key = (series_id, limit)
+    hit = _FRED_CACHE.get(key)
+    if hit and time.time() - hit[0] < _FRED_TTL_SECONDS:
+        return list(hit[1])
+    vals = _fetch_fred_obs_uncached(series_id, limit)
+    if vals:  # never cache a failed/empty lookup
+        _FRED_CACHE[key] = (time.time(), list(vals))
+    return vals
+
 def fetch_wti_oil_pct():
     try:
         oil_vals = fetch_fred_obs("DCOILWTICO", 25)
@@ -244,7 +688,7 @@ def fetch_wti_oil_pct():
     return 0.0
 
 @app.get("/api/autofetch")
-def autofetch_data():
+def autofetch_data(user: str = Depends(current_user)):
     icsa_vals = fetch_fred_obs("ICSA", 6)
     ccsa_vals = fetch_fred_obs("CCSA", 6)
 
@@ -260,8 +704,9 @@ def autofetch_data():
     }
 
 @app.post("/api/predict-nfp")
-def predict_nfp(data: NFPInput):
-    increment_usage(data.user_email)
+def predict_nfp(data: NFPInput, user: str = Depends(current_user)):
+    check_numbers(data)
+    increment_usage(user)
     clamp = lambda v: max(-1.0, min(1.0, v))
 
     sig_ism_srv = clamp(((data.ism_services_emp - data.ism_services_prev) + ((data.ism_services_emp - 50.0) * 0.5)) / 3.0)
@@ -331,8 +776,9 @@ def predict_nfp(data: NFPInput):
     return {"score": edge, "bias": bias, "tier": tier, "confidence": confidence, "summary": summary, "pairs": impacts}
 
 @app.post("/api/predict-cpi")
-def predict_cpi(data: CPIInput):
-    increment_usage(data.user_email)
+def predict_cpi(data: CPIInput, user: str = Depends(current_user)):
+    check_numbers(data)
+    increment_usage(user)
     clamp = lambda v: max(-1.0, min(1.0, v))
     sig_clev = clamp((data.cleveland_nowcast_mom - data.cpi_mom_consensus) / 0.12)
     sig_gas = clamp(data.gas_oil_pct_change / 6.0)
@@ -384,7 +830,8 @@ def predict_cpi(data: CPIInput):
     return {"score": score, "bias": bias, "tier": tier, "confidence": confidence, "summary": summary, "pairs": impacts}
 
 @app.post("/api/decode-nfp")
-def decode_nfp(d: DecodeNFPReq):
+def decode_nfp(d: DecodeNFPReq, user: str = Depends(current_user)):
+    check_numbers(d)
     nfp_diff = d.actual_nfp - d.consensus_nfp + (d.revisions_k * 0.5)
     unemp_diff = d.unemp_actual - d.unemp_forecast
     ahe_diff = d.ahe_actual - d.ahe_forecast
@@ -404,7 +851,8 @@ def decode_nfp(d: DecodeNFPReq):
     return {"verdict": verdict, "plan": plan}
 
 @app.post("/api/decode-cpi")
-def decode_cpi(d: DecodeCPIReq):
+def decode_cpi(d: DecodeCPIReq, user: str = Depends(current_user)):
+    check_numbers(d)
     head_diff = round(d.headline_actual - d.headline_forecast, 2)
     core_diff = round(d.core_actual - d.core_forecast, 2)
 
@@ -672,12 +1120,24 @@ def index():
   let isRegister = false;
   let currentUser = JSON.parse(localStorage.getItem("am_user") || "null");
 
+  function renderLogo(src) {
+    if (!src) return;
+    document.getElementById("headerLogoSlot").innerHTML = `<img src="${src}" alt="A&M Logo" />`;
+    document.getElementById("authLogoSlot").innerHTML = `<img src="${src}" alt="A&M Logo" />`;
+  }
+
   function applySavedLogo() {
-    const saved = localStorage.getItem("am_logo");
-    if (saved) {
-      document.getElementById("headerLogoSlot").innerHTML = `<img src="${saved}" alt="A&M Logo" />`;
-      document.getElementById("authLogoSlot").innerHTML = `<img src="${saved}" alt="A&M Logo" />`;
-    }
+    const cached = localStorage.getItem("am_logo");
+    if (cached) renderLogo(cached);
+    fetch("/api/logo")
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data && data.logo) {
+          localStorage.setItem("am_logo", data.logo);
+          renderLogo(data.logo);
+        }
+      })
+      .catch(() => {});
   }
   applySavedLogo();
 
@@ -685,9 +1145,24 @@ def index():
     const file = e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
+      try {
+        const res = await fetch("/api/logo", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: currentUser ? currentUser.email : "", logo: reader.result })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) { alert(data.detail || "The logo could not be saved to the database."); return; }
+        if (data.storage && !data.storage.includes("Permanent")) {
+          alert("Logo saved only to temporary storage. Database status: " + data.storage);
+        }
+      } catch (err) {
+        alert("The logo could not be saved to the database.");
+        return;
+      }
       localStorage.setItem("am_logo", reader.result);
-      applySavedLogo();
+      renderLogo(reader.result);
     };
     reader.readAsDataURL(file);
   }
@@ -730,9 +1205,14 @@ def index():
     calcCPI();
   }
 
-  function logout() {
+  async function logout() {
+    try { await fetch("/api/logout", { method: "POST" }); } catch (e) {}
     localStorage.removeItem("am_user");
     location.reload();
+  }
+
+  function esc(v) {
+    return String(v === null || v === undefined ? "" : v).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[c]));
   }
 
   async function toggleAdmin() {
@@ -740,10 +1220,11 @@ def index():
     panel.classList.toggle("hidden");
     if (!panel.classList.contains("hidden")) {
       const res = await fetch(`/api/admin/users?email=${encodeURIComponent(currentUser.email)}`);
+      if (!res.ok) { document.getElementById("dbStatusBadge").innerText = "Admin access denied or session expired. Please log in again."; return; }
       const data = await res.json();
       document.getElementById("dbStatusBadge").innerText = data.db_mode;
       document.getElementById("adminTableBody").innerHTML = data.users.map(u =>
-        `<tr><td><strong>${u.full_name}</strong></td><td>${u.email}</td><td>${u.whatsapp}</td><td>${u.calc_count}</td><td>${u.created_at}</td><td>${u.last_login}</td></tr>`
+        `<tr><td><strong>${esc(u.full_name)}</strong></td><td>${esc(u.email)}</td><td>${esc(u.whatsapp)}</td><td>${esc(u.calc_count)}</td><td>${esc(u.created_at)}</td><td>${esc(u.last_login)}</td></tr>`
       ).join("");
     }
   }
@@ -880,10 +1361,18 @@ def index():
     out.innerHTML = `<div style="color:var(--gold-bright); font-weight:800; margin-bottom:0.3rem;">${d.verdict}</div><p style="font-size:0.86rem;">${d.plan}</p>`;
   }
 
-  if (currentUser) enterTerminal();
+  if (currentUser) {
+    fetch("/api/me")
+      .then(r => r.ok ? r.json() : null)
+      .then(me => {
+        if (me) { currentUser.is_admin = me.is_admin; enterTerminal(); }
+        else { localStorage.removeItem("am_user"); currentUser = null; }
+      })
+      .catch(() => { enterTerminal(); });
+  }
 </script>
 </body>
 </html>"""
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
