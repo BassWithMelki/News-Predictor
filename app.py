@@ -870,6 +870,329 @@ def decode_cpi(d: DecodeCPIReq, user: str = Depends(current_user)):
         plan = "Numbers matched Wall Street consensus. Initial XAU/USD volatility is just stop-hunting; look for mean reversion back to pre-release levels."
     return {"verdict": verdict, "plan": plan}
 
+# ---------------------------------------------------------------------------
+# Self-service password reset (email + registered WhatsApp number, no email server needed)
+# ---------------------------------------------------------------------------
+class ResetPasswordReq(BaseModel):
+    email: str
+    whatsapp: str
+    new_password: str
+
+def _norm_phone(phone: str) -> str:
+    return re.sub(r"[\s\-()]", "", phone or "")
+
+@app.post("/api/reset-password")
+def reset_password(req: ResetPasswordReq, request: Request):
+    limiter.check(f"reset-ip:{client_ip(request)}", 8, 900)
+    email = req.email.strip().lower()[:254]
+    limiter.check(f"reset-email:{email}", 5, 900)  # also slow down guessing against one account
+    if not 8 <= len(req.new_password) <= 128:
+        raise HTTPException(status_code=400, detail="Password must be 8 to 128 characters long.")
+    mismatch = HTTPException(status_code=400, detail="Email and WhatsApp number did not match our records.")
+    submitted = _norm_phone(req.whatsapp)
+
+    conn = get_db_conn()
+    ph = ph_for(conn)
+    cur = conn.cursor()
+    try:
+        cur.execute(f"SELECT whatsapp FROM users WHERE email = {ph}", (email,))
+        row = cur.fetchone()
+        stored = _norm_phone(row["whatsapp"]) if row else ""
+        numbers_match = hmac.compare_digest(stored.encode("utf-8"), submitted.encode("utf-8"))
+        # The admin account is excluded: its WhatsApp number must never be enough to take it over,
+        # because the admin can read every customer's number (the secret used by this reset).
+        if not (row and submitted and numbers_match) or email == ADMIN_EMAIL:
+            raise mismatch
+        cur.execute(f"UPDATE users SET password_hash = {ph} WHERE email = {ph}", (hash_pwd(req.new_password), email))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    limiter.clear(f"login-email:{email}")
+    log.info("Password reset completed for %s", email)
+    return {"status": "ok"}
+
+# ---------------------------------------------------------------------------
+# Shared helpers for the new spike matrices
+# ---------------------------------------------------------------------------
+def _spike_rows(assets, bias_dir, mult, neutral_label="WHIPSAW / TWO-WAY"):
+    """bias_dir: +1 = USD bullish, -1 = USD bearish, 0 = no edge."""
+    rows = []
+    for a in assets:
+        mid = round(a["base"] * mult)
+        if bias_dir == 0:
+            direction = neutral_label
+        elif bias_dir > 0:
+            direction = "BEARISH (SELL)" if a["inv"] else "BULLISH (BUY)"
+        else:
+            direction = "BULLISH (BUY)" if a["inv"] else "BEARISH (SELL)"
+        rows.append({"pair": a["pair"], "direction": direction,
+                     "range": f"{max(20, mid - 12)} – {mid + 15} pips", "note": a["note"]})
+    return rows
+
+# ---------------------------------------------------------------------------
+# PPI V2 predictor + post-release decoder
+# ---------------------------------------------------------------------------
+class PPIInput(BaseModel):
+    user_email: str
+    ppi_mom_consensus: float = 0.3
+    ism_srv_prices: float = 73.0
+    ism_srv_prices_prev: float = 74.0
+    ism_mfg_prices: float = 75.2
+    ism_mfg_prices_prev: float = 77.9
+    gas_oil_pct_change: float = -10.3
+    regional_fed_prices: float = 28.0
+    regional_fed_prices_prev: float = 24.0
+    freight_rate_pct: float = 2.0
+    agri_metals_pct: float = 1.5
+    nfib_price_plans: float = 37.0
+    import_price_surprise: float = 0.0
+    is_jan_or_jul: bool = False
+
+class DecodePPIReq(BaseModel):
+    headline_forecast: float
+    headline_actual: float
+    core_forecast: float
+    core_actual: float
+
+@app.post("/api/predict-ppi")
+def predict_ppi(data: PPIInput, user: str = Depends(current_user)):
+    check_numbers(data)
+    increment_usage(user)
+    clamp = lambda v: max(-1.0, min(1.0, v))
+    srv_delta = data.ism_srv_prices - data.ism_srv_prices_prev
+
+    sig_srv = clamp((srv_delta + ((data.ism_srv_prices - 55.0) * 0.3)) / 4.0)
+    sig_mfg = clamp(((data.ism_mfg_prices - data.ism_mfg_prices_prev) + ((data.ism_mfg_prices - 52.0) * 0.3)) / 4.0)
+    sig_oil = clamp(data.gas_oil_pct_change / 6.0)
+    sig_fed = clamp(((data.regional_fed_prices - data.regional_fed_prices_prev) + ((data.regional_fed_prices - 20.0) * 0.25)) / 8.0)
+    sig_frt = clamp(data.freight_rate_pct / 8.0)
+    sig_met = clamp(data.agri_metals_pct / 5.0)
+    sig_nfib = clamp((data.nfib_price_plans - 22.0) / 8.0)
+    sig_imp = clamp(data.import_price_surprise / 0.3)
+
+    score = round(
+        (sig_srv * 22) + (sig_mfg * 18) + (sig_oil * 18) + (sig_fed * 14) +
+        (sig_frt * 8) + (sig_met * 8) + (sig_nfib * 7) + (sig_imp * 5), 1
+    )
+
+    # V2 safeguard 1: sharp oil drops widen retail fuel margins, which PPI counts as a price gain
+    margin_offset = data.gas_oil_pct_change < -10.0
+    if margin_offset:
+        score = round(score + 4.0, 1)
+
+    # V2 safeguard 2: dynamic no-trade buffer
+    buffer = 35.0 if data.is_jan_or_jul else 25.0
+    buffer_reason = "Jan/Jul seasonal-reset window" if data.is_jan_or_jul else "standard gate"
+    if (data.gas_oil_pct_change > 8.0 and srv_delta < -1.5) or (data.gas_oil_pct_change < -8.0 and srv_delta > 1.5):
+        if buffer < 38.0:
+            buffer = 38.0
+            buffer_reason = "oil and ISM services prices are pulling in opposite directions"
+
+    if abs(score) < buffer:
+        bias, bias_dir, mult = "NEUTRAL", 0, 0.55
+        verdict = "NO-TRADE / LOW EDGE"
+        tier = f"NO-TRADE / LOW EDGE (±{buffer:g} gate: {buffer_reason})"
+        summary = f"Score {score:+.1f} is inside the ±{buffer:g} gate ({buffer_reason}). Skip the PPI spike and wait for the print."
+    elif score >= buffer:
+        strong = score >= buffer + 20
+        bias, bias_dir, mult = "HOTTER", 1, (1.2 if strong else 0.9)
+        verdict = "HOTTER (USD BULLISH / GOLD BEARISH)"
+        tier = ("TIER 1 " if strong else "TIER 2 ") + verdict
+        summary = f"Producer-price proxies sit above the {data.ppi_mom_consensus}% consensus (score {score:+.1f} vs ±{buffer:g} gate). Lean USD up, Gold down."
+    else:
+        strong = score <= -(buffer + 20)
+        bias, bias_dir, mult = "COOLER", -1, (1.2 if strong else 0.9)
+        verdict = "COOLER (USD BEARISH / GOLD BULLISH)"
+        tier = ("TIER 1 " if strong else "TIER 2 ") + verdict
+        summary = f"Producer-price proxies sit below the {data.ppi_mom_consensus}% consensus (score {score:+.1f} vs ±{buffer:g} gate). Lean USD down, Gold up."
+    if margin_offset:
+        summary += " Includes the +4.0 retail-margin offset for the sharp oil drop."
+
+    assets = [
+        {"pair": "XAU/USD (Gold)", "base": 145, "inv": True,  "note": "PPI moves are usually smaller than CPI; let the spread settle for 2 minutes"},
+        {"pair": "USD/JPY",        "base": 65,  "inv": False, "note": "Follows US 2Y yield repricing after the print"},
+        {"pair": "EUR/USD",        "base": 58,  "inv": True,  "note": "Cleaner follow-through when core PPI agrees with headline"},
+        {"pair": "GBP/USD",        "base": 62,  "inv": True,  "note": "Wide spreads at 8:30 AM ET; wait for the 5m candle"},
+    ]
+    return {"score": score, "bias": bias, "verdict": verdict, "tier": tier, "buffer": buffer,
+            "buffer_reason": buffer_reason, "margin_offset_applied": margin_offset,
+            "summary": summary, "pairs": _spike_rows(assets, bias_dir, mult)}
+
+@app.post("/api/decode-ppi")
+def decode_ppi(d: DecodePPIReq, user: str = Depends(current_user)):
+    check_numbers(d)
+    head_diff = round(d.headline_actual - d.headline_forecast, 2)
+    core_diff = round(d.core_actual - d.core_forecast, 2)
+
+    if head_diff >= 0.2 and core_diff <= 0.0:
+        verdict = "PPI FALSE SPIKE / TRADE-MARGIN TRAP (HEADLINE HOT, CORE NOT)"
+        plan = ("Headline beat without a matching core beat usually means energy or volatile trade margins, not broad pricing pressure. "
+                "XAU/USD (Gold): fade the initial drop and look to BUY after the 5-minute candle closes. "
+                "USD/JPY: do not chase the first spike higher; wait for a pullback and a clear hold. "
+                "EUR/USD: expect the first dip to retrace; BUY only after the 5m close back above the pre-news level.")
+    elif head_diff <= -0.2 and core_diff >= 0.1:
+        verdict = "PPI MARGIN-DRIVEN HEADLINE MISS TRAP (CORE FIRM)"
+        plan = ("Headline missed but core stayed firm, so the weakness is probably volatile margins or energy. "
+                "XAU/USD (Gold): fade the initial rally and look to SELL a failed 5-minute breakout. "
+                "USD/JPY: the first drop is often bought back; wait for a 5m close back above the pre-news level before buying. "
+                "EUR/USD: treat the first push higher as suspect and SELL a failed breakout.")
+    elif core_diff >= 0.1 and head_diff >= 0:
+        verdict = "HOT CORE & HEADLINE PPI — LEAN USD BULLISH / GOLD BEARISH"
+        plan = ("Both measures beat, so the move has support. "
+                "XAU/USD (Gold): SELL the first 5-minute pullback. "
+                "USD/JPY: BUY the first 5-minute pullback while 2Y yields hold their rise. "
+                "EUR/USD: SELL the first 5-minute pullback. PPI usually moves price less than CPI, so keep size modest.")
+    elif core_diff <= -0.1 and head_diff <= 0:
+        verdict = "COOL CORE & HEADLINE PPI — LEAN USD BEARISH / GOLD BULLISH"
+        plan = ("Both measures missed. "
+                "XAU/USD (Gold): BUY the first 5-minute pullback once the spread has settled. "
+                "USD/JPY: SELL the first 5-minute pullback. "
+                "EUR/USD: BUY the first 5-minute pullback. Keep size modest because PPI reactions often fade.")
+    else:
+        verdict = "INLINE / MIXED PPI PRINT — STAND ASIDE"
+        plan = ("Headline and core offset each other or matched forecasts. "
+                "XAU/USD (Gold), USD/JPY and EUR/USD: expect two-way wicks with no clean trend, so skip it and keep capital for the next release.")
+    return {"verdict": verdict, "plan": plan}
+
+# ---------------------------------------------------------------------------
+# FOMC pre-meeting gauge + instant statement / chair press-conference decoder
+# ---------------------------------------------------------------------------
+FOMC_MOVES = ("CUT_25", "HOLD", "HIKE_25")
+FOMC_NFP = ("STRONG", "INLINE", "WEAK")
+FOMC_RATE = ("MORE_HAWKISH", "INLINE", "MORE_DOVISH")
+FOMC_DOTS = ("HAWKISH_SHIFT", "UNCHANGED", "DOVISH_SHIFT")
+FOMC_VOTES = ("UNANIMOUS", "HAWKISH_DISSENT", "DOVISH_DISSENT")
+FOMC_CUES = ("PENDING", "PUSHBACK_ON_CUTS", "DATA_DEPENDENT", "OPEN_TO_EASING")
+
+class FOMCPreInput(BaseModel):
+    user_email: str
+    fedwatch_prob_pct: float = 82.0
+    expected_move: str = "HOLD"
+    us2y_yield_5d_bps: float = 8.0
+    recent_core_cpi_surprise: float = 0.1
+    nfp_recent_edge: str = "STRONG"
+
+class DecodeFOMCReq(BaseModel):
+    rate_surprise: str
+    dot_plot_tone: str
+    vote_split: str
+    chair_presser_cue: str
+
+def _one_of(name: str, value: str, allowed):
+    if value not in allowed:
+        raise HTTPException(status_code=422, detail=f"'{name}' must be one of: {', '.join(allowed)}.")
+
+@app.post("/api/predict-fomc")
+def predict_fomc(data: FOMCPreInput, user: str = Depends(current_user)):
+    check_numbers(data)
+    _one_of("expected_move", data.expected_move, FOMC_MOVES)
+    _one_of("nfp_recent_edge", data.nfp_recent_edge, FOMC_NFP)
+    if not 0.0 <= data.fedwatch_prob_pct <= 100.0:
+        raise HTTPException(status_code=422, detail="'fedwatch_prob_pct' must be between 0 and 100.")
+    increment_usage(user)
+    clamp = lambda v: max(-1.0, min(1.0, v))
+
+    # Hawkish pressure score: positive = data and rates are leaning hawkish, negative = dovish
+    sig_yield = clamp(data.us2y_yield_5d_bps / 15.0)
+    sig_cpi = clamp(data.recent_core_cpi_surprise / 0.1)
+    sig_nfp = {"STRONG": 1.0, "INLINE": 0.0, "WEAK": -1.0}[data.nfp_recent_edge]
+    score = round((sig_yield * 40) + (sig_cpi * 35) + (sig_nfp * 25), 1)
+
+    gate = 30.0
+    crowded = data.fedwatch_prob_pct >= 85.0
+    if data.fedwatch_prob_pct >= 85.0:
+        reversal_risk = "ELEVATED"
+    elif data.fedwatch_prob_pct >= 70.0:
+        reversal_risk = "MODERATE"
+    else:
+        reversal_risk = "LOW"
+
+    move_text = {"CUT_25": "a 25 bp cut", "HOLD": "a hold", "HIKE_25": "a 25 bp hike"}[data.expected_move]
+    if score >= gate:
+        bias, bias_dir, mult = "HAWKISH", 1, (1.25 if score >= 55 else 0.95)
+        verdict = "HAWKISH LEAN (USD BULLISH / GOLD BEARISH)"
+        summary = (f"Market prices {move_text} at {data.fedwatch_prob_pct:g}%, but 2Y yields, core CPI and payrolls lean hawkish "
+                   f"(score {score:+.1f} vs ±{gate:g}). Risk is a hawkish Dot Plot / Statement tone.")
+    elif score <= -gate:
+        bias, bias_dir, mult = "DOVISH", -1, (1.25 if score <= -55 else 0.95)
+        verdict = "DOVISH LEAN (USD BEARISH / GOLD BULLISH)"
+        summary = (f"Market prices {move_text} at {data.fedwatch_prob_pct:g}%, but 2Y yields, core CPI and payrolls lean dovish "
+                   f"(score {score:+.1f} vs ±{gate:g}). Risk is a dovish Dot Plot / Statement tone.")
+    else:
+        bias, bias_dir, mult = "NEUTRAL", 0, 0.5
+        verdict = "NO-TRADE / INLINE HOLD"
+        summary = (f"Score {score:+.1f} is inside the ±{gate:g} gate. Data do not lean against the priced {move_text}; "
+                   "wait for the 2:00 PM ET statement before trading.")
+
+    tier = verdict
+    if crowded:
+        tier = "CROWDED CONSENSUS (BUY RUMOR / SELL FACT RISK) — " + verdict
+        summary += (f" FedWatch is at {data.fedwatch_prob_pct:g}% (85%+ is crowded): even an in-line decision can see the first spike fade, "
+                    "so do not chase the 2:00 PM move.")
+
+    assets = [
+        {"pair": "XAU/USD (Gold)", "base": 260, "inv": True,  "note": "Two-stage spike: 2:00 PM ET Statement + 2:30 PM ET Chair Warsh Presser"},
+        {"pair": "USD/JPY",        "base": 110, "inv": False, "note": "Moves with 2Y yields; the presser can reverse the statement move"},
+        {"pair": "EUR/USD",        "base": 90,  "inv": True,  "note": "Wait for the 5m close after the statement before entering"},
+        {"pair": "NAS100",         "base": 185, "inv": True,  "note": "Rate-sensitive; hawkish surprises pressure tech equities"},
+    ]
+    return {"score": score, "bias": bias, "verdict": verdict, "tier": tier, "gate": gate,
+            "crowded": crowded, "reversal_risk": reversal_risk, "summary": summary,
+            "pairs": _spike_rows(assets, bias_dir, mult, neutral_label="NO-TRADE / INLINE HOLD")}
+
+@app.post("/api/decode-fomc")
+def decode_fomc(d: DecodeFOMCReq, user: str = Depends(current_user)):
+    _one_of("rate_surprise", d.rate_surprise, FOMC_RATE)
+    _one_of("dot_plot_tone", d.dot_plot_tone, FOMC_DOTS)
+    _one_of("vote_split", d.vote_split, FOMC_VOTES)
+    _one_of("chair_presser_cue", d.chair_presser_cue, FOMC_CUES)
+
+    # +1 = hawkish pillar, -1 = dovish pillar (a hawkish dissent means someone wanted tighter policy)
+    statement = (
+        {"MORE_HAWKISH": 1, "INLINE": 0, "MORE_DOVISH": -1}[d.rate_surprise]
+        + {"HAWKISH_SHIFT": 1, "UNCHANGED": 0, "DOVISH_SHIFT": -1}[d.dot_plot_tone]
+        + {"HAWKISH_DISSENT": 1, "UNANIMOUS": 0, "DOVISH_DISSENT": -1}[d.vote_split]
+    )
+    pending = d.chair_presser_cue == "PENDING"
+    presser = {"PUSHBACK_ON_CUTS": 1, "DATA_DEPENDENT": 0, "OPEN_TO_EASING": -1, "PENDING": 0}[d.chair_presser_cue]
+    total = statement + presser
+    suffix = " (PROVISIONAL — WAIT FOR THE 2:30 PM PRESSER)" if pending else ""
+
+    reversal = (not pending) and ((statement >= 2 and presser == -1) or (statement <= -2 and presser == 1))
+    if reversal:
+        verdict = "CHAIR PRESSER REVERSAL TRAP (FADE THE 2:00 PM SPIKE)"
+        if statement > 0:
+            plan = ("The statement read hawkish but the Chair sounded open to easing, so the 2:00 PM USD spike is likely to unwind. "
+                    "XAU/USD (Gold): BUY the reversal once price reclaims the pre-statement level on a 5m close. "
+                    "USD/JPY: SELL a failed breakout back through the pre-statement level. "
+                    "EUR/USD: BUY after price reclaims the pre-statement level on a 5m close.")
+        else:
+            plan = ("The statement read dovish but the Chair pushed back on cuts, so the 2:00 PM USD sell-off is likely to unwind. "
+                    "XAU/USD (Gold): SELL a failed rally back through the pre-statement level. "
+                    "USD/JPY: BUY after price reclaims the pre-statement level on a 5m close. "
+                    "EUR/USD: SELL a failed breakout back through the pre-statement level.")
+    elif (pending and statement >= 2) or (not pending and total >= 2):
+        verdict = "CLEAN HAWKISH BREAKOUT" + suffix
+        plan = ("The pillars agree on a hawkish read. "
+                "XAU/USD (Gold): SELL the first 5-minute pullback after the spike. "
+                "USD/JPY: BUY the first 5-minute pullback while 2Y yields hold higher. "
+                "EUR/USD: SELL the first 5-minute pullback. "
+                + ("Do not size up until the Chair confirms at 2:30 PM." if pending else "Trend can run into the New York close; trail stops under the pullback low."))
+    elif (pending and statement <= -2) or (not pending and total <= -2):
+        verdict = "CLEAN DOVISH RALLY" + suffix
+        plan = ("The pillars agree on a dovish read. "
+                "XAU/USD (Gold): BUY the first 5-minute pullback after the spike. "
+                "USD/JPY: SELL the first 5-minute pullback as 2Y yields slip. "
+                "EUR/USD: BUY the first 5-minute pullback. "
+                + ("Do not size up until the Chair confirms at 2:30 PM." if pending else "Trail stops under the pullback low."))
+    else:
+        verdict = "CHOPPY / UNCHANGED HOLD" + suffix
+        plan = ("The pillars offset or add nothing new. "
+                "XAU/USD (Gold), USD/JPY and EUR/USD: expect two-way wicks and fakeouts between 2:00 and 3:00 PM ET. "
+                "Stand aside, or only trade a clear 5m break with the Chair's tone behind it.")
+    return {"verdict": verdict, "plan": plan, "statement_score": statement, "presser_score": presser, "total": total}
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """<!DOCTYPE html>
@@ -897,7 +1220,7 @@ def index():
   .btn:hover { background: var(--gold-bright); }
   .btn:disabled { opacity: 0.6; cursor: not-allowed; }
   .btn-outline { background: transparent; border: 1px solid var(--gold); color: var(--gold); padding: 0.55rem 0.9rem; border-radius: 8px; font-weight: 700; cursor: pointer; font-size: 0.82rem; }
-  .tabs { display: flex; gap: 0.75rem; margin-bottom: 1.25rem; }
+  .tabs { display: flex; gap: 0.75rem; margin-bottom: 1.25rem; flex-wrap: wrap; }
   .tab { padding: 0.7rem 1.4rem; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--muted); font-weight: 700; cursor: pointer; }
   .tab.active { background: var(--gold); color: #051c15; border-color: var(--gold); }
   .grid { display: grid; grid-template-columns: 1.15fr 1.25fr; gap: 1.25rem; }
@@ -907,6 +1230,7 @@ def index():
   .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
   label { display: block; font-size: 0.75rem; color: var(--muted); margin-bottom: 0.2rem; }
   input[type="number"], input[type="text"], input[type="email"], input[type="password"] { width: 100%; background: #04140f; border: 1px solid var(--border); color: #fff; padding: 0.5rem; border-radius: 6px; font-size: 0.9rem; }
+  select { width: 100%; background: #04140f; border: 1px solid var(--border); color: #fff; padding: 0.5rem; border-radius: 6px; font-size: 0.9rem; }
   .check-row { grid-column: span 2; display: flex; align-items: center; gap: 0.5rem; background: #04140f; padding: 0.6rem; border-radius: 6px; border: 1px solid var(--border); }
   .check-row input { width: auto; accent-color: var(--gold); }
   .verdict-box { padding: 1rem; border-radius: 8px; background: #04140f; border-left: 4px solid var(--gold); margin-bottom: 1rem; }
@@ -936,18 +1260,35 @@ def index():
       <h2 style="justify-content:center; margin-top:0.25rem;">Trading &amp; Finance Department</h2>
       <p style="font-size:0.85rem; color:var(--muted);">Sign in or register to access the Red-Folder Institutional Terminal</p>
     </div>
+    <div id="authMain">
     <div id="regFields" class="hidden">
       <label>Full Name</label><input type="text" id="regName" placeholder="e.g. John Kamau" style="margin-bottom:0.75rem;" />
       <label>WhatsApp / Phone Number</label><input type="text" id="regPhone" placeholder="e.g. +254 712 345678" style="margin-bottom:0.75rem;" />
     </div>
     <label>Email Address</label><input type="email" id="authEmail" placeholder="you@example.com" style="margin-bottom:0.75rem;" />
     <label>Password</label><input type="password" id="authPass" placeholder="••••••••" style="margin-bottom:1rem;" />
+    <p id="forgotRow" style="text-align:right; font-size:0.8rem; margin:-0.5rem 0 1rem 0;"><a href="#" style="color:var(--gold); font-weight:700;" onclick="showReset(); return false;">Forgot Password?</a></p>
     <button class="btn" style="width:100%;" onclick="submitAuth()" id="authSubmitBtn">Sign In to Terminal</button>
     <p id="authErr" style="color:var(--red); font-size:0.82rem; margin-top:0.6rem; text-align:center;"></p>
     <p style="text-align:center; font-size:0.85rem; margin-top:1rem; color:var(--muted);">
       <span id="togglePrompt">New to A&amp;M Group?</span>
       <a href="#" style="color:var(--gold); font-weight:700;" onclick="toggleAuthMode(); return false;" id="toggleLink">Create Account</a>
     </p>
+    </div>
+
+    <div id="resetView" class="hidden">
+      <h2 style="justify-content:center; margin-bottom:0.4rem;">Reset Your Password</h2>
+      <p style="font-size:0.82rem; color:var(--muted); margin-bottom:1rem; text-align:center;">Enter the email and WhatsApp number you registered with, then choose a new password.</p>
+      <label>Registered Email</label><input type="email" id="resetEmail" placeholder="you@example.com" style="margin-bottom:0.75rem;" />
+      <label>Registered WhatsApp Number</label><input type="text" id="resetPhone" placeholder="e.g. +254 712 345678" style="margin-bottom:0.75rem;" />
+      <label>New Password</label><input type="password" id="resetPass" placeholder="At least 8 characters" style="margin-bottom:1rem;" />
+      <button class="btn" style="width:100%;" onclick="submitReset()" id="resetBtn">Reset Password</button>
+      <p id="resetErr" style="color:var(--red); font-size:0.82rem; margin-top:0.6rem; text-align:center;"></p>
+      <p id="resetOk" style="color:var(--green); font-size:0.85rem; margin-top:0.6rem; text-align:center; font-weight:700;"></p>
+      <p style="text-align:center; font-size:0.85rem; margin-top:1rem; color:var(--muted);">
+        <a href="#" style="color:var(--gold); font-weight:700;" onclick="hideReset(); return false;">&larr; Back to Sign In</a>
+      </p>
+    </div>
   </div>
 
   <div id="appSection" class="hidden">
@@ -977,8 +1318,10 @@ def index():
 
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.75rem; margin-bottom:1.25rem;">
       <div class="tabs" style="margin:0;">
-        <button class="tab active" id="tabNFP" onclick="switchTab('NFP')">🇺🇸 NFP V2 Predictor (91.2% Win Rate)</button>
-        <button class="tab" id="tabCPI" onclick="switchTab('CPI')">🔥 CPI Predictor (80.5% Win Rate)</button>
+        <button class="tab active" id="tabNFP" onclick="switchTab('NFP')">🇺🇸 NFP V2 Predictor</button>
+        <button class="tab" id="tabCPI" onclick="switchTab('CPI')">🔥 CPI Predictor</button>
+        <button class="tab" id="tabPPI" onclick="switchTab('PPI')">🏭 PPI V2 Predictor</button>
+        <button class="tab" id="tabFOMC" onclick="switchTab('FOMC')">🏛️ FOMC &amp; Fed Chair</button>
       </div>
       <button class="btn" id="autoFetchBtn" onclick="autoFetch()">⚡ Auto-Fetch Latest Fed &amp; Oil Data</button>
     </div>
@@ -1113,6 +1456,160 @@ def index():
         </div>
       </div>
     </div>
+
+    <div id="viewPPI" class="grid hidden">
+      <div class="card">
+        <h2><span>1. PPI V2 Leading Producer-Price Proxies</span> <span style="font-size:0.75rem; color:var(--muted);">8-Factor Model + V2 Safeguards</span></h2>
+        <div class="form-grid">
+          <div><label>PPI MoM Consensus (%) [Reference]</label><input type="number" id="ppi_cons" value="0.3" step="0.05" /></div>
+          <div><label>WTI Oil / Gas Monthly % Δ [18%]</label><input type="number" id="ppi_gas" value="-10.3" step="0.1" /></div>
+          <div><label>ISM Services Prices Paid [22%]</label><input type="number" id="ppi_srvp" value="73.0" step="0.1" /></div>
+          <div><label>ISM Services Prices Prev</label><input type="number" id="ppi_srvp_p" value="74.0" step="0.1" /></div>
+          <div><label>ISM Mfg Prices Paid [18%]</label><input type="number" id="ppi_mfgp" value="75.2" step="0.1" /></div>
+          <div><label>ISM Mfg Prices Prev</label><input type="number" id="ppi_mfgp_p" value="77.9" step="0.1" /></div>
+          <div><label>Regional Fed Prices Paid (Empire/Philly) [14%]</label><input type="number" id="ppi_fed" value="28.0" step="0.1" /></div>
+          <div><label>Regional Fed Prices Paid Prev</label><input type="number" id="ppi_fed_p" value="24.0" step="0.1" /></div>
+          <div><label>Freight Rate % Δ [8%]</label><input type="number" id="ppi_frt" value="2.0" step="0.1" /></div>
+          <div><label>Agri &amp; Metals % Δ [8%]</label><input type="number" id="ppi_met" value="1.5" step="0.1" /></div>
+          <div><label>NFIB Small Biz Price Plans % [7%]</label><input type="number" id="ppi_nfib" value="37.0" step="0.5" /></div>
+          <div><label>Import Price Surprise (%) [5%]</label><input type="number" id="ppi_imp" value="0.0" step="0.1" /></div>
+          <div class="check-row">
+            <input type="checkbox" id="ppi_jj" />
+            <label for="ppi_jj" style="margin:0; color:var(--text); cursor:pointer;">Jan / Jul Seasonal-Reset Window? (Widens No-Trade Gate to ±35)</label>
+          </div>
+        </div>
+        <button class="btn" style="width:100%; margin-top:1rem;" onclick="calcPPI()">Calculate PPI V2 Outcome &amp; Gold/FX Spikes</button>
+
+        <details class="source-guide" open>
+          <summary>📖 Where to Find Manual PPI Numbers (Free Official Links)</summary>
+          <ul>
+            <li><strong>PPI Consensus &amp; Import Price Surprise:</strong> <a href="https://www.forexfactory.com/calendar" target="_blank">Forex Factory Calendar</a> (USD events: PPI and Import Prices actual vs forecast).</li>
+            <li><strong>ISM Services &amp; Mfg Prices Paid:</strong> <a href="https://www.ismworld.org/supply-management-news-and-reports/reports/ism-pmi-reports/" target="_blank">ISM PMI Reports</a> (Check the "Prices" sub-index in each report).</li>
+            <li><strong>Regional Fed Prices Paid:</strong> <a href="https://www.newyorkfed.org/survey/empire/empiresurvey_overview" target="_blank">NY Empire State Survey</a> &amp; <a href="https://www.philadelphiafed.org/manufacturing-bos" target="_blank">Philadelphia Fed Manufacturing Survey</a> (Enter the average of the two Prices Paid readings, and last month's average).</li>
+            <li><strong>Oil, Metals, Agriculture &amp; Freight % Δ:</strong> <a href="https://tradingeconomics.com/commodities" target="_blank">Trading Economics Commodities</a> (Energy, metals, agriculture and freight indexes).</li>
+            <li><strong>NFIB Price Plans (%):</strong> <a href="https://www.nfib.com/surveys/small-business-economic-trends/" target="_blank">NFIB Economic Trends</a>.</li>
+          </ul>
+        </details>
+      </div>
+
+      <div>
+        <div class="card">
+          <h2><span>2. PPI V2 Forecast &amp; XAU/USD + FX Spike Matrix</span> <span id="ppiTier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
+          <div class="verdict-box" id="ppiBox">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
+              <span id="ppiBias" class="big-score bull">READY</span>
+              <span id="ppiScore" style="font-weight:700;"></span>
+            </div>
+            <p id="ppiSummary" style="font-size:0.88rem; color:#d1d5db;"></p>
+          </div>
+          <table>
+            <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
+            <tbody id="ppiPairs"></tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>⚡ 3. Post-Release PPI &amp; XAU/USD Action Decoder (After 8:30 AM Print)</h2>
+          <div class="form-grid">
+            <div><label>Headline PPI MoM Forecast (%)</label><input type="number" id="dec_ppi_hf" value="0.3" step="0.1" /></div>
+            <div><label>Headline PPI MoM Actual (%)</label><input type="number" id="dec_ppi_ha" value="0.5" step="0.1" /></div>
+            <div><label>Core PPI MoM Forecast (%)</label><input type="number" id="dec_ppi_cf" value="0.3" step="0.1" /></div>
+            <div><label>Core PPI MoM Actual (%)</label><input type="number" id="dec_ppi_ca" value="0.2" step="0.1" /></div>
+          </div>
+          <button class="btn-outline" style="width:100%; margin-top:0.85rem;" onclick="decodePPI()">Decode Actual PPI &amp; Get Gold/FX Trade Plan</button>
+          <div id="ppiDecodeOut" class="decoder-box hidden"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="viewFOMC" class="grid hidden">
+      <div class="card">
+        <h2><span>1. FOMC Pre-Meeting Pricing &amp; Reversal Risk Gauge</span> <span style="font-size:0.75rem; color:var(--muted);">Before 2:00 PM ET</span></h2>
+        <div class="form-grid">
+          <div><label>CME FedWatch Probability of Expected Move (%)</label><input type="number" id="fomc_prob" value="82" step="1" /></div>
+          <div><label>Expected Move (Priced In)</label>
+            <select id="fomc_move">
+              <option value="CUT_25">Cut 25 bp</option>
+              <option value="HOLD" selected>Hold</option>
+              <option value="HIKE_25">Hike 25 bp</option>
+            </select>
+          </div>
+          <div><label>US 2-Year Yield 5-Day Change (bps)</label><input type="number" id="fomc_us2y" value="8" step="0.5" /></div>
+          <div><label>Recent Core CPI Surprise (%)</label><input type="number" id="fomc_cpi" value="0.1" step="0.05" /></div>
+          <div style="grid-column: span 2;"><label>Recent NFP Edge</label>
+            <select id="fomc_nfp">
+              <option value="STRONG" selected>Strong (beat)</option>
+              <option value="INLINE">In line</option>
+              <option value="WEAK">Weak (miss)</option>
+            </select>
+          </div>
+        </div>
+        <button class="btn" style="width:100%; margin-top:1rem;" onclick="calcFOMC()">Gauge FOMC Pricing &amp; Reversal Risk</button>
+
+        <details class="source-guide" open>
+          <summary>📖 Where to Find Manual FOMC Numbers (Free Official Links)</summary>
+          <ul>
+            <li><strong>Probability of the Expected Move:</strong> <a href="https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html" target="_blank">CME FedWatch Tool</a> (Use the probability of the most likely outcome for the next meeting).</li>
+            <li><strong>Meeting Dates, Statements &amp; Press Conferences:</strong> <a href="https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm" target="_blank">Federal Reserve FOMC Calendar &amp; Statements</a> (Statement 2:00 PM ET, press conference 2:30 PM ET).</li>
+            <li><strong>US 2-Year Treasury Yield (5-day change):</strong> <a href="https://fred.stlouisfed.org/series/DGS2" target="_blank">US 2-Year Treasury Yield (FRED)</a> (Subtract the yield 5 trading days ago, in basis points).</li>
+          </ul>
+        </details>
+      </div>
+
+      <div>
+        <div class="card">
+          <h2><span>2. FOMC Lean &amp; XAU/USD + FX Spike Matrix</span> <span id="fomcTier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
+          <div class="verdict-box" id="fomcBox">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
+              <span id="fomcBias" class="big-score bull">READY</span>
+              <span id="fomcScore" style="font-weight:700;"></span>
+            </div>
+            <p id="fomcSummary" style="font-size:0.88rem; color:#d1d5db;"></p>
+          </div>
+          <table>
+            <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
+            <tbody id="fomcPairs"></tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>⚡ 3. Instant Statement &amp; Chair Warsh Presser Decoder (After 2:00 PM ET)</h2>
+          <div class="form-grid">
+            <div><label>Rate Decision vs Pricing</label>
+              <select id="dec_fomc_rate">
+                <option value="MORE_HAWKISH">More hawkish than priced</option>
+                <option value="INLINE" selected>In line with pricing</option>
+                <option value="MORE_DOVISH">More dovish than priced</option>
+              </select>
+            </div>
+            <div><label>Dot Plot / Statement Tone</label>
+              <select id="dec_fomc_dots">
+                <option value="HAWKISH_SHIFT">Hawkish shift</option>
+                <option value="UNCHANGED" selected>Unchanged</option>
+                <option value="DOVISH_SHIFT">Dovish shift</option>
+              </select>
+            </div>
+            <div><label>Vote Split</label>
+              <select id="dec_fomc_vote">
+                <option value="UNANIMOUS" selected>Unanimous</option>
+                <option value="HAWKISH_DISSENT">Hawkish dissent</option>
+                <option value="DOVISH_DISSENT">Dovish dissent</option>
+              </select>
+            </div>
+            <div><label>Chair Presser Cue (2:30 PM ET)</label>
+              <select id="dec_fomc_chair">
+                <option value="PENDING" selected>Pending (presser not started)</option>
+                <option value="PUSHBACK_ON_CUTS">Pushback on cuts</option>
+                <option value="DATA_DEPENDENT">Data dependent</option>
+                <option value="OPEN_TO_EASING">Open to easing</option>
+              </select>
+            </div>
+          </div>
+          <button class="btn-outline" style="width:100%; margin-top:0.85rem;" onclick="decodeFOMC()">Decode Statement &amp; Get Gold/FX Trade Plan</button>
+          <div id="fomcDecodeOut" class="decoder-box hidden"></div>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1167,6 +1664,47 @@ def index():
     reader.readAsDataURL(file);
   }
 
+  function showReset() {
+    document.getElementById("authMain").classList.add("hidden");
+    document.getElementById("resetView").classList.remove("hidden");
+    document.getElementById("resetEmail").value = document.getElementById("authEmail").value.trim();
+    document.getElementById("resetErr").innerText = "";
+    document.getElementById("resetOk").innerText = "";
+  }
+
+  function hideReset() {
+    document.getElementById("resetView").classList.add("hidden");
+    document.getElementById("authMain").classList.remove("hidden");
+    document.getElementById("authErr").innerText = "";
+  }
+
+  async function submitReset() {
+    const err = document.getElementById("resetErr");
+    const ok = document.getElementById("resetOk");
+    const btn = document.getElementById("resetBtn");
+    err.innerText = "";
+    ok.innerText = "";
+    const email = document.getElementById("resetEmail").value.trim();
+    const whatsapp = document.getElementById("resetPhone").value.trim();
+    const new_password = document.getElementById("resetPass").value.trim();
+    if (!email || !whatsapp || !new_password) { err.innerText = "Please fill in all three fields."; return; }
+    if (new_password.length < 8) { err.innerText = "New password must be at least 8 characters."; return; }
+    btn.disabled = true;
+    try {
+      const res = await fetch("/api/reset-password", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, whatsapp, new_password }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { err.innerText = (typeof data.detail === "string") ? data.detail : "Password reset failed."; return; }
+      document.getElementById("authEmail").value = email;
+      document.getElementById("authPass").value = "";
+      document.getElementById("resetPass").value = "";
+      ok.innerText = "Password updated. Click Back to Sign In and log in with your new password.";
+    } catch (e) {
+      err.innerText = "Could not reach the server. Please try again.";
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   function toggleAuthMode() {
     isRegister = !isRegister;
     document.getElementById("regFields").classList.toggle("hidden", !isRegister);
@@ -1174,6 +1712,7 @@ def index():
     document.getElementById("togglePrompt").innerText = isRegister ? "Already have an account?" : "New to A&M Group?";
     document.getElementById("toggleLink").innerText = isRegister ? "Sign In" : "Create Account";
     document.getElementById("authErr").innerText = "";
+    document.getElementById("forgotRow").classList.toggle("hidden", isRegister);
   }
 
   async function submitAuth() {
@@ -1229,11 +1768,16 @@ def index():
     }
   }
 
+  let ppiLoaded = false;
+  let fomcLoaded = false;
+
   function switchTab(tab) {
-    document.getElementById("tabNFP").classList.toggle("active", tab === "NFP");
-    document.getElementById("tabCPI").classList.toggle("active", tab === "CPI");
-    document.getElementById("viewNFP").classList.toggle("hidden", tab !== "NFP");
-    document.getElementById("viewCPI").classList.toggle("hidden", tab !== "CPI");
+    ["NFP", "CPI", "PPI", "FOMC"].forEach(t => {
+      document.getElementById("tab" + t).classList.toggle("active", t === tab);
+      document.getElementById("view" + t).classList.toggle("hidden", t !== tab);
+    });
+    if (tab === "PPI" && !ppiLoaded) { ppiLoaded = true; calcPPI(); }
+    if (tab === "FOMC" && !fomcLoaded) { fomcLoaded = true; calcFOMC(); }
   }
 
   async function autoFetch() {
@@ -1253,9 +1797,12 @@ def index():
       document.getElementById("nfp_icsa").value = data.nfp.icsa_change_k;
       document.getElementById("nfp_ccsa").value = data.nfp.ccsa_change_k;
       document.getElementById("cpi_gas").value = data.cpi.gas_oil_pct_change;
+      document.getElementById("ppi_gas").value = data.cpi.gas_oil_pct_change;
       status.innerText = `✅ Updated from: ${data.source}`;
       await calcNFP();
       await calcCPI();
+      ppiLoaded = true;
+      await calcPPI();
     } catch (err) {
       status.innerText = "⚠️ Live feed timed out — existing values kept. You can calculate normally.";
     } finally {
@@ -1359,6 +1906,102 @@ def index():
     const out = document.getElementById("cpiDecodeOut");
     out.classList.remove("hidden");
     out.innerHTML = `<div style="color:var(--gold-bright); font-weight:800; margin-bottom:0.3rem;">${d.verdict}</div><p style="font-size:0.86rem;">${d.plan}</p>`;
+  }
+
+  async function apiPost(url, payload) {
+    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, data };
+  }
+
+  function errText(data) {
+    return (data && typeof data.detail === "string") ? data.detail : "Please check the inputs and try again.";
+  }
+
+  function pairRows(pairs) {
+    return pairs.map(p => {
+      const cls = p.direction.includes("BULLISH") ? "bull" : p.direction.includes("BEARISH") ? "bear" : "neut";
+      return `<tr><td><strong>${esc(p.pair)}</strong></td><td class="${cls}">${esc(p.direction)}</td><td>${esc(p.range)}</td><td style="color:var(--muted)">${esc(p.note)}</td></tr>`;
+    }).join("");
+  }
+
+  function setVerdict(prefix, d, labels) {
+    const el = document.getElementById(prefix + "Bias");
+    const up = d.bias === "HOTTER" || d.bias === "HAWKISH";
+    const down = d.bias === "COOLER" || d.bias === "DOVISH";
+    el.innerText = up ? labels.up : down ? labels.down : labels.flat;
+    el.className = "big-score " + (up ? "bull" : down ? "bear" : "neut");
+  }
+
+  function showDecode(id, d) {
+    const out = document.getElementById(id);
+    out.classList.remove("hidden");
+    out.innerHTML = `<div style="color:var(--gold-bright); font-weight:800; margin-bottom:0.3rem;">${esc(d.verdict)}</div><p style="font-size:0.86rem;">${esc(d.plan)}</p>`;
+  }
+
+  async function calcPPI() {
+    const val = id => Number(document.getElementById(id).value);
+    const payload = {
+      user_email: currentUser ? currentUser.email : "",
+      ppi_mom_consensus: val("ppi_cons"),
+      ism_srv_prices: val("ppi_srvp"),
+      ism_srv_prices_prev: val("ppi_srvp_p"),
+      ism_mfg_prices: val("ppi_mfgp"),
+      ism_mfg_prices_prev: val("ppi_mfgp_p"),
+      gas_oil_pct_change: val("ppi_gas"),
+      regional_fed_prices: val("ppi_fed"),
+      regional_fed_prices_prev: val("ppi_fed_p"),
+      freight_rate_pct: val("ppi_frt"),
+      agri_metals_pct: val("ppi_met"),
+      nfib_price_plans: val("ppi_nfib"),
+      import_price_surprise: val("ppi_imp"),
+      is_jan_or_jul: document.getElementById("ppi_jj").checked
+    };
+    const { ok, data } = await apiPost("/api/predict-ppi", payload);
+    if (!ok) { document.getElementById("ppiSummary").innerText = errText(data); return; }
+    setVerdict("ppi", data, { up: "HOTTER (USD BULLISH / GOLD BEARISH)", down: "COOLER (USD BEARISH / GOLD BULLISH)", flat: "NO-TRADE / LOW EDGE" });
+    document.getElementById("ppiTier").innerText = data.tier;
+    document.getElementById("ppiScore").innerText = `Score: ${data.score > 0 ? "+" : ""}${data.score} | Gate: ±${data.buffer}`;
+    document.getElementById("ppiSummary").innerText = data.summary;
+    document.getElementById("ppiPairs").innerHTML = pairRows(data.pairs);
+  }
+
+  async function decodePPI() {
+    const val = id => Number(document.getElementById(id).value);
+    const { ok, data } = await apiPost("/api/decode-ppi", {
+      headline_forecast: val("dec_ppi_hf"), headline_actual: val("dec_ppi_ha"),
+      core_forecast: val("dec_ppi_cf"), core_actual: val("dec_ppi_ca")
+    });
+    showDecode("ppiDecodeOut", ok ? data : { verdict: "Could not decode", plan: errText(data) });
+  }
+
+  async function calcFOMC() {
+    const val = id => Number(document.getElementById(id).value);
+    const payload = {
+      user_email: currentUser ? currentUser.email : "",
+      fedwatch_prob_pct: val("fomc_prob"),
+      expected_move: document.getElementById("fomc_move").value,
+      us2y_yield_5d_bps: val("fomc_us2y"),
+      recent_core_cpi_surprise: val("fomc_cpi"),
+      nfp_recent_edge: document.getElementById("fomc_nfp").value
+    };
+    const { ok, data } = await apiPost("/api/predict-fomc", payload);
+    if (!ok) { document.getElementById("fomcSummary").innerText = errText(data); return; }
+    setVerdict("fomc", data, { up: "HAWKISH LEAN (USD BULLISH / GOLD BEARISH)", down: "DOVISH LEAN (USD BEARISH / GOLD BULLISH)", flat: "NO-TRADE / INLINE HOLD" });
+    document.getElementById("fomcTier").innerText = data.crowded ? "CROWDED CONSENSUS (BUY RUMOR / SELL FACT RISK)" : "";
+    document.getElementById("fomcScore").innerText = `Hawkish score: ${data.score > 0 ? "+" : ""}${data.score} | Gate: ±${data.gate} | Reversal risk: ${data.reversal_risk}`;
+    document.getElementById("fomcSummary").innerText = data.summary;
+    document.getElementById("fomcPairs").innerHTML = pairRows(data.pairs);
+  }
+
+  async function decodeFOMC() {
+    const { ok, data } = await apiPost("/api/decode-fomc", {
+      rate_surprise: document.getElementById("dec_fomc_rate").value,
+      dot_plot_tone: document.getElementById("dec_fomc_dots").value,
+      vote_split: document.getElementById("dec_fomc_vote").value,
+      chair_presser_cue: document.getElementById("dec_fomc_chair").value
+    });
+    showDecode("fomcDecodeOut", ok ? data : { verdict: "Could not decode", plan: errText(data) });
   }
 
   if (currentUser) {
