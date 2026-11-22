@@ -696,11 +696,20 @@ def autofetch_data(user: str = Depends(require_admin)):
     ccsa_delta = round((ccsa_vals[0] - ccsa_vals[4]) / 1000.0, 1) if len(ccsa_vals) >= 5 else -18.0
     oil_pct = fetch_wti_oil_pct()
 
+    # GBP / EUR energy inputs: Brent crude (daily) and EU natural gas (monthly)
+    brent = fetch_fred_obs("DCOILBRENTEU", 25)
+    brent_pct = round(((brent[0] - brent[20]) / brent[20]) * 100.0, 2) if len(brent) >= 21 and brent[20] != 0 else 0.0
+    eu_gas = fetch_fred_obs("PNGASEUUSDM", 3)
+    eu_gas_pct = round(((eu_gas[0] - eu_gas[1]) / eu_gas[1]) * 100.0, 2) if len(eu_gas) >= 2 and eu_gas[1] != 0 else brent_pct
+    eur_energy_pct = round((eu_gas_pct * 0.6) + (brent_pct * 0.4), 2)
+
     source_note = "Live Federal Reserve (FRED API) & WTI Crude Feed" if FRED_API_KEY else "Live Federal Reserve Public CSV & WTI Crude Feed"
     return {
         "source": source_note,
         "nfp": {"icsa_change_k": icsa_delta, "ccsa_change_k": ccsa_delta},
-        "cpi": {"gas_oil_pct_change": oil_pct}
+        "cpi": {"gas_oil_pct_change": oil_pct},
+        "gbp": {"uk_gas_petrol_pct": brent_pct},
+        "eur": {"ttf_gas_brent_pct": eur_energy_pct}
     }
 
 @app.post("/api/predict-nfp")
@@ -1622,6 +1631,7 @@ class PublishEventReq(BaseModel):
     inputs: dict = {}
     result: dict = {}
     active: bool = True
+    released: bool = False  # False = countdown only; True = projection visible to clients
 
 def _parse_release(text: str) -> datetime:
     try:
@@ -1673,13 +1683,16 @@ def publish_event(req: PublishEventReq, admin: str = Depends(require_admin)):
         raise HTTPException(status_code=422, detail="'title' must be 1 to 120 characters.")
     release = _parse_release(req.release_utc)
     result = req.result
-    pairs = result.get("pairs")
-    if not ({"bias", "score", "summary"} <= set(result) and isinstance(pairs, list)
-            and all(isinstance(p, dict) for p in pairs)):
-        raise HTTPException(status_code=422, detail="'result' is not a valid forecast. Calculate it first, then publish.")
+    if req.released:
+        pairs = result.get("pairs")
+        if not ({"bias", "score", "summary"} <= set(result) and isinstance(pairs, list)
+                and all(isinstance(p, dict) for p in pairs)):
+            raise HTTPException(status_code=422, detail="'result' is not a valid forecast. Calculate it first, then release.")
+    else:
+        result = {}  # countdown-only events never store a projection
     record = {
         "event_id": event_id, "currency": currency, "module": module, "title": title,
-        "release_utc": release.strftime("%Y-%m-%dT%H:%M:%SZ"), "active": bool(req.active),
+        "release_utc": release.strftime("%Y-%m-%dT%H:%M:%SZ"), "active": bool(req.active), "released": bool(req.released),
         "inputs": {k: v for k, v in req.inputs.items() if k != "user_email"},
         "result": result, "updated_at": _utc_iso(),  # server-stamped so it cannot be back-dated
     }
@@ -1715,6 +1728,40 @@ def publish_event(req: PublishEventReq, admin: str = Depends(require_admin)):
     log.info("Calendar event published: %s at %s", event_id, record["release_utc"])
     return {"status": "ok", "event_id": event_id, "release_utc": record["release_utc"],
             "updated_at": record["updated_at"], "storage": DB_STATUS_MSG}
+
+class PublishDecodeReq(BaseModel):
+    event_id: str
+    verdict: str
+    plan: str
+
+@app.post("/api/admin/publish-decode")
+def publish_decode(req: PublishDecodeReq, admin: str = Depends(require_admin)):
+    """The admin decodes the actual print and sends the verdict + trade plan to the event's client card."""
+    verdict, plan = req.verdict.strip(), req.plan.strip()
+    if not 1 <= len(verdict) <= 300 or not 1 <= len(plan) <= 3000:
+        raise HTTPException(status_code=422, detail="Run the decoder first, then publish its result.")
+    with _EVENTS_LOCK:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            events = _read_events(cur, ph_for(conn))
+            if req.event_id not in events:
+                raise HTTPException(status_code=404, detail="Schedule or release this event first, then publish the decoded result.")
+            events[req.event_id]["decoded"] = {"verdict": verdict, "plan": plan, "updated_at": _utc_iso()}
+            _write_events(conn, cur, events)
+            conn.commit()
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception as e:
+            conn.rollback()
+            log.exception("Publishing decode failed")
+            raise HTTPException(status_code=500, detail=f"Could not publish the decoded result: {_first_line(e)}")
+        finally:
+            cur.close()
+            conn.close()
+    log.info("Decoded result published: %s", req.event_id)
+    return {"status": "ok", "event_id": req.event_id}
 
 @app.delete("/api/admin/publish-event/{event_id}")
 def remove_event(event_id: str, admin: str = Depends(require_admin)):
@@ -1766,12 +1813,16 @@ def next_events(request: Request, response: Response, user: str = Depends(curren
 
     def shape(ev):
         inputs = ev.get("inputs") or {}
+        released = bool(ev.get("released", False))
+        result = ev.get("result")
         if not want_all:
             keep = PUBLIC_EVENT_INPUT_KEYS.get(f"{ev.get('currency')}_{ev.get('module')}", ())
             inputs = {k: inputs[k] for k in keep if k in inputs}
-        return {"event_id": ev.get("event_id"), "currency": ev.get("currency"), "module": ev.get("module"),
+            if not released:  # before the release clients get the countdown only, never the projection
+                inputs, result = {}, None
+        return {"released": released, "decoded": ev.get("decoded"), "event_id": ev.get("event_id"), "currency": ev.get("currency"), "module": ev.get("module"),
                 "title": ev.get("title"), "release_utc": ev.get("release_utc"), "active": ev.get("active", True),
-                "updated_at": ev.get("updated_at"), "result": ev.get("result"), "inputs": inputs}
+                "updated_at": ev.get("updated_at"), "result": result, "inputs": inputs}
 
     server_time = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     if want_all:
@@ -2490,7 +2541,7 @@ def index():
     const status = document.getElementById("fetchStatus");
     btn.disabled = true;
     btn.innerText = "⏳ Fetching...";
-    status.innerText = "Fetching live Federal Reserve & WTI Crude Oil data...";
+    status.innerText = "Fetching live Federal Reserve, WTI, Brent & EU gas data...";
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 8000);
@@ -2503,6 +2554,16 @@ def index():
       document.getElementById("nfp_ccsa").value = data.nfp.ccsa_change_k;
       document.getElementById("cpi_gas").value = data.cpi.gas_oil_pct_change;
       document.getElementById("ppi_gas").value = data.cpi.gas_oil_pct_change;
+      if (data.gbp) {
+        const g = document.getElementById("gbpcpi_uk_gas_petrol_pct");
+        if (g) g.value = data.gbp.uk_gas_petrol_pct;
+      }
+      if (data.eur) {
+        const e = document.getElementById("eurcpi_ttf_gas_brent_pct");
+        if (e) e.value = data.eur.ttf_gas_brent_pct;
+      }
+      if (loadedTab.GBP_CPI) calcGeneric("GBP_CPI");
+      if (loadedTab.EUR_CPI) calcGeneric("EUR_CPI");
       status.innerText = `✅ Updated from: ${data.source}`;
       await calcNFP();
       await calcCPI();
@@ -3110,7 +3171,9 @@ def index():
       <h2><span>📅 Schedule &amp; Publish — ${FLAG[m.cur]} ${esc(m.title)}</span></h2>
       <label>Release Date &amp; Time (your local time — saved as UTC)</label>
       <input type="datetime-local" id="rel_${key}" style="margin-bottom:0.85rem;" />
-      <button class="btn btn-publish" onclick="publishEvent('${key}')">📡 Publish to Next-Event Client Queue</button>
+      <button class="btn-outline" style="width:100%; margin-bottom:0.6rem;" onclick="publishEvent('${key}', false)">⏳ Step 1: Schedule Countdown (no projection shown)</button>
+      <button class="btn btn-publish" onclick="publishEvent('${key}', true)">📡 Step 2: Release Projection to Clients</button>
+      <button class="btn-outline" style="width:100%; margin-top:0.6rem; border-color:var(--gold-bright); color:var(--gold-bright);" onclick="publishDecode('${key}')">📣 Step 3: Send Decoded Result to Clients (decode below first)</button>
       <button class="btn-outline" style="width:100%; margin-top:0.6rem;" onclick="togglePreview()">👁️ Preview Client View</button>
       <p id="pubst_${key}" style="font-size:0.8rem; margin-top:0.5rem; color:var(--gold);"></p>
     </div>`;
@@ -3120,7 +3183,7 @@ def index():
     return USD_PAYLOAD[key] ? USD_PAYLOAD[key]() : genericPayload(key);
   }
 
-  async function publishEvent(key) {
+  async function publishEvent(key, released) {
     const m = MODS[key];
     const status = document.getElementById("pubst_" + key);
     const local = document.getElementById("rel_" + key).value;
@@ -3128,28 +3191,46 @@ def index():
     const when = new Date(local);
     if (isNaN(when.getTime())) { status.innerText = "That release date & time is not valid."; return; }
     const releaseUtc = when.toISOString().slice(0, 19) + "Z";
-    if (!confirm(`Publish ${m.title} to clients for ${when.toLocaleString()}? It replaces any queued ${key} event.`)) return;
+    if (!confirm(released ? `Release the ${m.title} projection to clients now? Release time: ${when.toLocaleString()}.` : `Schedule the ${m.title} countdown for ${when.toLocaleString()}? Clients will see the countdown only, no projection.`)) return;
     status.innerText = "Calculating and publishing...";
     try {
-      const inputs = payloadForKey(key);
-      const calc = await apiPost(m.api, { user_email: currentUser.email, ...inputs });
-      if (!calc.ok) { status.innerText = "Could not calculate: " + errText(calc.data); return; }
-      if (key === "USD_NFP") renderForecast("nfp", calc.data, true);
-      else if (key === "USD_CPI") renderForecast("cpi", calc.data, false);
-      else if (key === "USD_PPI") renderPPI(calc.data);
-      else if (key === "USD_FOMC") renderFOMC(calc.data);
-      else renderGeneric(key, calc.data);
+      let inputs = {};
+      let result = {};
+      if (released) {
+        inputs = payloadForKey(key);
+        const calc = await apiPost(m.api, { user_email: currentUser.email, ...inputs });
+        if (!calc.ok) { status.innerText = "Could not calculate: " + errText(calc.data); return; }
+        result = calc.data;
+        if (key === "USD_NFP") renderForecast("nfp", calc.data, true);
+        else if (key === "USD_CPI") renderForecast("cpi", calc.data, false);
+        else if (key === "USD_PPI") renderPPI(calc.data);
+        else if (key === "USD_FOMC") renderFOMC(calc.data);
+        else renderGeneric(key, calc.data);
+      }
       const pub = await apiPost("/api/admin/publish-event", {
         event_id: key, currency: m.cur, title: m.title, release_utc: releaseUtc,
-        inputs: inputs, result: calc.data, active: true
+        inputs: inputs, result: result, active: true, released: !!released
       });
       if (!pub.ok) { status.innerText = "Publish failed: " + errText(pub.data); return; }
       const warn = pub.data.storage && !pub.data.storage.includes("Permanent") ? " WARNING: saved only to temporary storage (" + pub.data.storage + ")." : "";
-      status.innerText = `✅ Queued for ${when.toLocaleString()}.${warn}`;
+      status.innerText = (released ? `✅ Projection released to clients.` : `✅ Countdown scheduled for ${when.toLocaleString()}.`) + warn;
       loadQueue();
     } catch (e) {
       status.innerText = "Publish failed. Check your connection and try again.";
     }
+  }
+
+  const DECODE_OUT_ID = { USD_NFP: "nfpDecodeOut", USD_CPI: "cpiDecodeOut", USD_PPI: "ppiDecodeOut", USD_FOMC: "fomcDecodeOut" };
+
+  async function publishDecode(key) {
+    const status = document.getElementById("pubst_" + key);
+    const out = document.getElementById(DECODE_OUT_ID[key] || ("dec_" + MODS[key].prefix + "_out"));
+    const verdict = out && out.children[0] ? out.children[0].innerText.trim() : "";
+    const plan = out && out.children[1] ? out.children[1].innerText.trim() : "";
+    if (!verdict || out.classList.contains("hidden")) { status.innerText = "Run the decoder for this module first (Step 3 box below), then send it."; return; }
+    if (!confirm(`Send this decoded result to clients?\n\n${verdict}`)) return;
+    const pub = await apiPost("/api/admin/publish-decode", { event_id: key, verdict: verdict, plan: plan });
+    status.innerText = pub.ok ? "✅ Decoded result sent to clients." : "Could not send: " + errText(pub.data);
   }
 
   // ---- admin queue manager ----
@@ -3178,7 +3259,7 @@ def index():
         const st = eventState(ev, now);
         return `<tr><td><strong>${esc(FLAG[ev.currency] || "")} ${esc(ev.title)}</strong><br><span style="color:var(--muted); font-size:0.75rem;">${esc(ev.event_id)}</span></td>
           <td>${esc(fmtTime(ev.release_utc))}</td><td>${esc(ev.release_utc)}</td>
-          <td><span class="pill ${st.cls}">${st.label}</span></td>
+          <td><span class="pill ${st.cls}">${st.label}</span> <span class="pill ${ev.released ? "live" : "up"}">${ev.released ? "PROJECTION LIVE" : "COUNTDOWN ONLY"}</span></td>
           <td><button class="btn-outline" onclick="removeEvent('${esc(ev.event_id)}')">Remove</button></td></tr>`;
       }).join("");
     } catch (e) {
@@ -3236,7 +3317,27 @@ def index():
     return `Score: ${sign}${d.score}`;
   }
 
+  function decodedHtml(ev) {
+    const d = ev.decoded;
+    if (!d) return "";
+    return `<div class="decoder-box" style="margin-top:1.1rem; border-width:2px; text-align:left;">
+      <div class="desk-badge" style="margin-bottom:0.6rem;">⚡ A&amp;M Research Desk — Post-Release Decode (Updated: ${esc(fmtTime(d.updated_at))})</div>
+      <div style="color:var(--gold-bright); font-weight:800; margin-bottom:0.3rem;">${esc(d.verdict)}</div>
+      <p style="font-size:0.88rem;">${esc(d.plan)}</p></div>`;
+  }
+
+  function teaserCardHtml(ev) {
+    return `<div class="card" style="border-color:var(--gold); text-align:center;">
+      <div class="dept-tag" style="margin-bottom:0.4rem;">Next Event</div>
+      <h2 style="justify-content:center; font-size:1.25rem;">${esc(FLAG[ev.currency] || "")} ${esc(ev.title)} — Prediction</h2>
+      <div class="countdown" data-release="${esc(ev.release_utc)}">⏳ Releases in: --d --h --m --s</div>
+      <p style="font-size:0.88rem; color:var(--muted);">The A&amp;M Group Research Desk will publish its projection here before the release. This page updates automatically.</p>
+      ${decodedHtml(ev)}
+    </div>`;
+  }
+
   function eventCardHtml(ev) {
+    if (!ev.released || !ev.result) return teaserCardHtml(ev);
     const key = `${ev.currency}_${ev.module}`;
     const m = MODS[key];
     const d = ev.result || {};
@@ -3245,10 +3346,8 @@ def index():
     const down = d.bias === "COOLER" || d.bias === "DOVISH";
     const tier = d.tier || (d.crowded ? "CROWDED CONSENSUS (BUY RUMOR / SELL FACT RISK)" : "");
     const idp = "cdec_" + ev.event_id;
-    const decoder = DEC[key] ? `<div class="card" style="margin-top:1.1rem; margin-bottom:0;">
-        <h2>⚡ Post-Release Action Decoder</h2>${decoderFormHtml(key, idp, ev.inputs)}</div>` : "";
+    const decoder = decodedHtml(ev);
     return `<div class="card" style="border-color:var(--gold);">
-      <div class="countdown" data-release="${esc(ev.release_utc)}">⏳ Releases in: --d --h --m --s</div>
       <div class="desk-badge" style="margin-bottom:0.9rem;">🏛️ A&amp;M Group Research Desk — Official Signal (Updated: ${esc(fmtTime(ev.updated_at))})</div>
       <h2><span>${esc(FLAG[ev.currency] || "")} ${esc(ev.title)} — Asset &amp; FX Spike Matrix</span> <span style="font-size:0.75rem; color:var(--gold);">${esc(tier)}</span></h2>
       <div class="verdict-box">
@@ -3273,7 +3372,7 @@ def index():
       if (!res.ok) throw new Error("bad response");
       const data = await res.json();
       serverOffset = Date.parse(data.server_time) - Date.now();
-      const sig = (data.events || []).map(e => e.event_id + "|" + e.updated_at + "|" + e.release_utc).join(",");
+      const sig = (data.events || []).map(e => e.event_id + "|" + e.updated_at + "|" + e.release_utc + "|" + e.released + "|" + (e.decoded ? e.decoded.updated_at : "")).join(",");
       if (!force && sig === lastQueueSig) { tickCountdowns(); return; }
       lastQueueSig = sig;
       if (!data.events.length) {
