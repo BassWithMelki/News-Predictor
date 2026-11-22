@@ -688,7 +688,7 @@ def fetch_wti_oil_pct():
     return 0.0
 
 @app.get("/api/autofetch")
-def autofetch_data(user: str = Depends(current_user)):
+def autofetch_data(user: str = Depends(require_admin)):
     icsa_vals = fetch_fred_obs("ICSA", 6)
     ccsa_vals = fetch_fred_obs("CCSA", 6)
 
@@ -704,7 +704,7 @@ def autofetch_data(user: str = Depends(current_user)):
     }
 
 @app.post("/api/predict-nfp")
-def predict_nfp(data: NFPInput, user: str = Depends(current_user)):
+def predict_nfp(data: NFPInput, user: str = Depends(require_admin)):
     check_numbers(data)
     increment_usage(user)
     clamp = lambda v: max(-1.0, min(1.0, v))
@@ -776,7 +776,7 @@ def predict_nfp(data: NFPInput, user: str = Depends(current_user)):
     return {"score": edge, "bias": bias, "tier": tier, "confidence": confidence, "summary": summary, "pairs": impacts}
 
 @app.post("/api/predict-cpi")
-def predict_cpi(data: CPIInput, user: str = Depends(current_user)):
+def predict_cpi(data: CPIInput, user: str = Depends(require_admin)):
     check_numbers(data)
     increment_usage(user)
     clamp = lambda v: max(-1.0, min(1.0, v))
@@ -956,7 +956,7 @@ class DecodePPIReq(BaseModel):
     core_actual: float
 
 @app.post("/api/predict-ppi")
-def predict_ppi(data: PPIInput, user: str = Depends(current_user)):
+def predict_ppi(data: PPIInput, user: str = Depends(require_admin)):
     check_numbers(data)
     increment_usage(user)
     clamp = lambda v: max(-1.0, min(1.0, v))
@@ -1084,7 +1084,7 @@ def _one_of(name: str, value: str, allowed):
         raise HTTPException(status_code=422, detail=f"'{name}' must be one of: {', '.join(allowed)}.")
 
 @app.post("/api/predict-fomc")
-def predict_fomc(data: FOMCPreInput, user: str = Depends(current_user)):
+def predict_fomc(data: FOMCPreInput, user: str = Depends(require_admin)):
     check_numbers(data)
     _one_of("expected_move", data.expected_move, FOMC_MOVES)
     _one_of("nfp_recent_edge", data.nfp_recent_edge, FOMC_NFP)
@@ -1193,6 +1193,102 @@ def decode_fomc(d: DecodeFOMCReq, user: str = Depends(current_user)):
                 "Stand aside, or only trade a clear 5m break with the Chair's tone behind it.")
     return {"verdict": verdict, "plan": plan, "statement_score": statement, "presser_score": presser, "total": total}
 
+# ---------------------------------------------------------------------------
+# Research Desk: the admin publishes official forecasts, clients read them
+# (stored in the site_settings table as signal_nfp / signal_cpi / signal_ppi / signal_fomc)
+# ---------------------------------------------------------------------------
+SIGNAL_MODULES = ("NFP", "CPI", "PPI", "FOMC")
+MAX_SIGNAL_CHARS = 60_000
+# Clients never receive the raw proxy inputs, except values the post-release decoder needs.
+PUBLIC_INPUT_KEYS = {"NFP": ("consensus_nfp",)}
+
+class PublishSignalReq(BaseModel):
+    module: str
+    inputs: dict
+    result: dict
+    updated_at: str = ""
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+@app.post("/api/admin/publish-signal")
+def publish_signal(req: PublishSignalReq, admin: str = Depends(require_admin)):
+    module = req.module.strip().upper()
+    if module not in SIGNAL_MODULES:
+        raise HTTPException(status_code=422, detail="'module' must be one of: NFP, CPI, PPI, FOMC.")
+    result = req.result
+    pairs = result.get("pairs")
+    if not ({"bias", "score", "summary"} <= set(result) and isinstance(pairs, list)
+            and all(isinstance(p, dict) for p in pairs)):
+        raise HTTPException(status_code=422, detail="'result' is not a valid forecast. Calculate it first, then publish.")
+    inputs = {k: v for k, v in req.inputs.items() if k != "user_email"}
+    # The server stamps the time, so the "Updated" label clients see cannot be wrong or back-dated.
+    payload = {"module": module, "inputs": inputs, "result": result, "updated_at": _utc_iso()}
+    text = json.dumps(payload, separators=(",", ":"))
+    if len(text) > MAX_SIGNAL_CHARS:
+        raise HTTPException(status_code=413, detail="That forecast is too large to publish.")
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        if is_pg(conn):
+            cur.execute(
+                "INSERT INTO site_settings (setting_key, setting_value) VALUES (%s, %s) "
+                "ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value",
+                (f"signal_{module.lower()}", text)
+            )
+        else:
+            cur.execute(
+                "INSERT OR REPLACE INTO site_settings (setting_key, setting_value) VALUES (?, ?)",
+                (f"signal_{module.lower()}", text)
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        log.exception("Publishing signal failed")
+        raise HTTPException(status_code=500, detail=f"Could not publish the signal: {_first_line(e)}")
+    finally:
+        cur.close()
+        conn.close()
+    log.info("Desk signal published: %s", module)
+    return {"status": "ok", "module": module, "updated_at": payload["updated_at"], "storage": DB_STATUS_MSG}
+
+@app.get("/api/signals")
+def get_signals(response: Response, user: str = Depends(current_user)):
+    response.headers["Cache-Control"] = "no-store"
+    is_admin = user == ADMIN_EMAIL
+    keys = [f"signal_{m.lower()}" for m in SIGNAL_MODULES]
+    conn = get_db_conn()
+    ph = ph_for(conn)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            f"SELECT setting_key, setting_value FROM site_settings WHERE setting_key IN ({', '.join([ph] * len(keys))})",
+            tuple(keys)
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+    stored = {}
+    for row in rows:
+        try:
+            stored[row["setting_key"]] = json.loads(row["setting_value"])
+        except Exception:
+            continue
+    signals = {}
+    for module in SIGNAL_MODULES:
+        item = stored.get(f"signal_{module.lower()}")
+        if not item:
+            signals[module] = None
+            continue
+        inputs = item.get("inputs") or {}
+        if not is_admin:
+            inputs = {k: inputs[k] for k in PUBLIC_INPUT_KEYS.get(module, ()) if k in inputs}
+        signals[module] = {"module": module, "result": item.get("result"),
+                           "updated_at": item.get("updated_at"), "inputs": inputs}
+    return {"signals": signals}
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """<!DOCTYPE html>
@@ -1243,6 +1339,11 @@ def index():
   .neut { color: var(--amber); font-weight: 700; }
   .auth-wrap { max-width: 440px; margin: 3rem auto; background: var(--card); border: 1px solid var(--gold); border-radius: 14px; padding: 2rem; }
   .hidden { display: none !important; }
+  .client-only { display: none; }
+  .client-mode .client-only { display: block; }
+  .client-mode .desk-only { display: none !important; }
+  .client-mode .grid { grid-template-columns: 1fr; }
+  .desk-badge { background: #04140f; border: 1px solid var(--gold); color: var(--gold-bright); padding: 0.55rem 0.9rem; border-radius: 8px; font-weight: 800; font-size: 0.82rem; }
   .decoder-box { margin-top: 0.9rem; padding: 0.9rem; background: #04140f; border: 1px solid var(--gold); border-radius: 8px; }
   .source-guide { margin-top: 1rem; padding: 0.85rem; background: #04140f; border: 1px solid var(--border); border-radius: 8px; font-size: 0.8rem; }
   .source-guide summary { cursor: pointer; color: var(--gold-bright); font-weight: 700; }
@@ -1303,7 +1404,8 @@ def index():
       <div class="top-actions">
         <span id="userWelcome" style="font-size:0.82rem; color:var(--muted);"></span>
         <button class="btn-outline hidden" id="adminBtn" onclick="toggleAdmin()">👑 Admin Monitor</button>
-        <label class="btn-outline" style="margin:0; cursor:pointer;">🖼️ Upload Logo<input type="file" accept="image/*" style="display:none;" onchange="handleLogo(event)" /></label>
+        <button class="btn-outline hidden" id="previewBtn" onclick="togglePreview()">👁️ Preview Client View</button>
+        <label class="btn-outline desk-only" style="margin:0; cursor:pointer;">🖼️ Upload Logo<input type="file" accept="image/*" style="display:none;" onchange="handleLogo(event)" /></label>
         <button class="btn-outline" onclick="logout()">Logout</button>
       </div>
     </header>
@@ -1323,12 +1425,12 @@ def index():
         <button class="tab" id="tabPPI" onclick="switchTab('PPI')">🏭 PPI V2 Predictor</button>
         <button class="tab" id="tabFOMC" onclick="switchTab('FOMC')">🏛️ FOMC &amp; Fed Chair</button>
       </div>
-      <button class="btn" id="autoFetchBtn" onclick="autoFetch()">⚡ Auto-Fetch Latest Fed &amp; Oil Data</button>
+      <button class="btn desk-only" id="autoFetchBtn" onclick="autoFetch()">⚡ Auto-Fetch Latest Fed &amp; Oil Data</button>
     </div>
-    <p id="fetchStatus" style="font-size:0.8rem; color:var(--gold); margin-bottom:1rem;"></p>
+    <p id="fetchStatus" class="desk-only" style="font-size:0.8rem; color:var(--gold); margin-bottom:1rem;"></p>
 
     <div id="viewNFP" class="grid">
-      <div class="card">
+      <div class="card desk-only" id="nfpInputCard">
         <h2><span>1. NFP Survey-Week Proxy Inputs (V2)</span> <span style="font-size:0.75rem; color:var(--muted);">Week of 12th</span></h2>
         <div class="form-grid">
           <div><label>NFP Consensus Forecast (K)</label><input type="number" id="nfp_cons" value="110" /></div>
@@ -1366,7 +1468,26 @@ def index():
       </div>
 
       <div>
-        <div class="card">
+        <div class="card client-only" id="nfpClientPanel">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.6rem; margin-bottom:0.9rem;">
+            <div class="desk-badge" id="nfpBadge">🏛️ A&amp;M Group Research Desk — Official Pre-Release Signal</div>
+            <button class="btn-outline" onclick="loadSignals()">🔄 Refresh Latest Desk Signal</button>
+          </div>
+          <h2><span>🇺🇸 NFP — Forecast &amp; XAU/USD + FX Spike Matrix</span> <span id="nfpCTier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
+          <div class="verdict-box">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
+              <span id="nfpCBias" class="big-score neut">Loading...</span>
+              <span id="nfpCScore" style="font-weight:700;"></span>
+            </div>
+            <p id="nfpCSummary" style="font-size:0.88rem; color:#d1d5db;"></p>
+          </div>
+          <table>
+            <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
+            <tbody id="nfpCPairs"></tbody>
+          </table>
+        </div>
+
+        <div class="card desk-only" id="nfpDeskCard">
           <h2><span>2. V2 NFP Forecast &amp; XAU/USD + FX Spike Matrix</span> <span id="nfpTier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
           <div class="verdict-box" id="nfpBox">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
@@ -1379,6 +1500,8 @@ def index():
             <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
             <tbody id="nfpPairs"></tbody>
           </table>
+          <button class="btn" style="width:100%; margin-top:0.25rem;" onclick="publishSignal('NFP')">📡 Publish Official Desk Forecast to Clients</button>
+          <p id="nfpPubStatus" style="font-size:0.8rem; margin-top:0.5rem; color:var(--gold);"></p>
         </div>
 
         <div class="card">
@@ -1398,7 +1521,7 @@ def index():
     </div>
 
     <div id="viewCPI" class="grid hidden">
-      <div class="card">
+      <div class="card desk-only" id="cpiInputCard">
         <h2><span>1. CPI Leading Inflation Proxies</span> <span style="font-size:0.75rem; color:var(--muted);">8-Factor Model</span></h2>
         <div class="form-grid">
           <div><label>CPI MoM Consensus (%) [Target]</label><input type="number" id="cpi_cons" value="0.3" step="0.05" /></div>
@@ -1428,7 +1551,26 @@ def index():
       </div>
 
       <div>
-        <div class="card">
+        <div class="card client-only" id="cpiClientPanel">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.6rem; margin-bottom:0.9rem;">
+            <div class="desk-badge" id="cpiBadge">🏛️ A&amp;M Group Research Desk — Official Pre-Release Signal</div>
+            <button class="btn-outline" onclick="loadSignals()">🔄 Refresh Latest Desk Signal</button>
+          </div>
+          <h2><span>🔥 CPI — Forecast &amp; XAU/USD + FX Spike Matrix</span> <span id="cpiCTier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
+          <div class="verdict-box">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
+              <span id="cpiCBias" class="big-score neut">Loading...</span>
+              <span id="cpiCScore" style="font-weight:700;"></span>
+            </div>
+            <p id="cpiCSummary" style="font-size:0.88rem; color:#d1d5db;"></p>
+          </div>
+          <table>
+            <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
+            <tbody id="cpiCPairs"></tbody>
+          </table>
+        </div>
+
+        <div class="card desk-only" id="cpiDeskCard">
           <h2><span>2. CPI Forecast &amp; XAU/USD + FX Spike Matrix</span> <span id="cpiTier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
           <div class="verdict-box" id="cpiBox">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
@@ -1441,6 +1583,8 @@ def index():
             <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
             <tbody id="cpiPairs"></tbody>
           </table>
+          <button class="btn" style="width:100%; margin-top:0.25rem;" onclick="publishSignal('CPI')">📡 Publish Official Desk Forecast to Clients</button>
+          <p id="cpiPubStatus" style="font-size:0.8rem; margin-top:0.5rem; color:var(--gold);"></p>
         </div>
 
         <div class="card">
@@ -1458,7 +1602,7 @@ def index():
     </div>
 
     <div id="viewPPI" class="grid hidden">
-      <div class="card">
+      <div class="card desk-only" id="ppiInputCard">
         <h2><span>1. PPI V2 Leading Producer-Price Proxies</span> <span style="font-size:0.75rem; color:var(--muted);">8-Factor Model + V2 Safeguards</span></h2>
         <div class="form-grid">
           <div><label>PPI MoM Consensus (%) [Reference]</label><input type="number" id="ppi_cons" value="0.3" step="0.05" /></div>
@@ -1493,7 +1637,26 @@ def index():
       </div>
 
       <div>
-        <div class="card">
+        <div class="card client-only" id="ppiClientPanel">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.6rem; margin-bottom:0.9rem;">
+            <div class="desk-badge" id="ppiBadge">🏛️ A&amp;M Group Research Desk — Official Pre-Release Signal</div>
+            <button class="btn-outline" onclick="loadSignals()">🔄 Refresh Latest Desk Signal</button>
+          </div>
+          <h2><span>🏭 PPI — Forecast &amp; XAU/USD + FX Spike Matrix</span> <span id="ppiCTier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
+          <div class="verdict-box">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
+              <span id="ppiCBias" class="big-score neut">Loading...</span>
+              <span id="ppiCScore" style="font-weight:700;"></span>
+            </div>
+            <p id="ppiCSummary" style="font-size:0.88rem; color:#d1d5db;"></p>
+          </div>
+          <table>
+            <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
+            <tbody id="ppiCPairs"></tbody>
+          </table>
+        </div>
+
+        <div class="card desk-only" id="ppiDeskCard">
           <h2><span>2. PPI V2 Forecast &amp; XAU/USD + FX Spike Matrix</span> <span id="ppiTier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
           <div class="verdict-box" id="ppiBox">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
@@ -1506,6 +1669,8 @@ def index():
             <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
             <tbody id="ppiPairs"></tbody>
           </table>
+          <button class="btn" style="width:100%; margin-top:0.25rem;" onclick="publishSignal('PPI')">📡 Publish Official Desk Forecast to Clients</button>
+          <p id="ppiPubStatus" style="font-size:0.8rem; margin-top:0.5rem; color:var(--gold);"></p>
         </div>
 
         <div class="card">
@@ -1523,7 +1688,7 @@ def index():
     </div>
 
     <div id="viewFOMC" class="grid hidden">
-      <div class="card">
+      <div class="card desk-only" id="fomcInputCard">
         <h2><span>1. FOMC Pre-Meeting Pricing &amp; Reversal Risk Gauge</span> <span style="font-size:0.75rem; color:var(--muted);">Before 2:00 PM ET</span></h2>
         <div class="form-grid">
           <div><label>CME FedWatch Probability of Expected Move (%)</label><input type="number" id="fomc_prob" value="82" step="1" /></div>
@@ -1557,7 +1722,26 @@ def index():
       </div>
 
       <div>
-        <div class="card">
+        <div class="card client-only" id="fomcClientPanel">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.6rem; margin-bottom:0.9rem;">
+            <div class="desk-badge" id="fomcBadge">🏛️ A&amp;M Group Research Desk — Official Pre-Release Signal</div>
+            <button class="btn-outline" onclick="loadSignals()">🔄 Refresh Latest Desk Signal</button>
+          </div>
+          <h2><span>🏛️ FOMC — Lean &amp; XAU/USD + FX Spike Matrix</span> <span id="fomcCTier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
+          <div class="verdict-box">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
+              <span id="fomcCBias" class="big-score neut">Loading...</span>
+              <span id="fomcCScore" style="font-weight:700;"></span>
+            </div>
+            <p id="fomcCSummary" style="font-size:0.88rem; color:#d1d5db;"></p>
+          </div>
+          <table>
+            <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
+            <tbody id="fomcCPairs"></tbody>
+          </table>
+        </div>
+
+        <div class="card desk-only" id="fomcDeskCard">
           <h2><span>2. FOMC Lean &amp; XAU/USD + FX Spike Matrix</span> <span id="fomcTier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
           <div class="verdict-box" id="fomcBox">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
@@ -1570,6 +1754,8 @@ def index():
             <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
             <tbody id="fomcPairs"></tbody>
           </table>
+          <button class="btn" style="width:100%; margin-top:0.25rem;" onclick="publishSignal('FOMC')">📡 Publish Official Desk Forecast to Clients</button>
+          <p id="fomcPubStatus" style="font-size:0.8rem; margin-top:0.5rem; color:var(--gold);"></p>
         </div>
 
         <div class="card">
@@ -1739,9 +1925,15 @@ def index():
     document.getElementById("authSection").classList.add("hidden");
     document.getElementById("appSection").classList.remove("hidden");
     document.getElementById("userWelcome").innerText = `Welcome, ${currentUser.full_name}`;
-    if (currentUser.is_admin) document.getElementById("adminBtn").classList.remove("hidden");
-    calcNFP();
-    calcCPI();
+    if (currentUser.is_admin) {
+      document.getElementById("adminBtn").classList.remove("hidden");
+      document.getElementById("previewBtn").classList.remove("hidden");
+      setMode("desk");
+      calcNFP();
+      calcCPI();
+    } else {
+      setMode("client");
+    }
   }
 
   async function logout() {
@@ -1776,8 +1968,8 @@ def index():
       document.getElementById("tab" + t).classList.toggle("active", t === tab);
       document.getElementById("view" + t).classList.toggle("hidden", t !== tab);
     });
-    if (tab === "PPI" && !ppiLoaded) { ppiLoaded = true; calcPPI(); }
-    if (tab === "FOMC" && !fomcLoaded) { fomcLoaded = true; calcFOMC(); }
+    if (tab === "PPI" && !ppiLoaded && viewMode === "desk") { ppiLoaded = true; calcPPI(); }
+    if (tab === "FOMC" && !fomcLoaded && viewMode === "desk") { fomcLoaded = true; calcFOMC(); }
   }
 
   async function autoFetch() {
@@ -1939,10 +2131,9 @@ def index():
     out.innerHTML = `<div style="color:var(--gold-bright); font-weight:800; margin-bottom:0.3rem;">${esc(d.verdict)}</div><p style="font-size:0.86rem;">${esc(d.plan)}</p>`;
   }
 
-  async function calcPPI() {
+  function ppiPayload() {
     const val = id => Number(document.getElementById(id).value);
-    const payload = {
-      user_email: currentUser ? currentUser.email : "",
+    return {
       ppi_mom_consensus: val("ppi_cons"),
       ism_srv_prices: val("ppi_srvp"),
       ism_srv_prices_prev: val("ppi_srvp_p"),
@@ -1957,13 +2148,20 @@ def index():
       import_price_surprise: val("ppi_imp"),
       is_jan_or_jul: document.getElementById("ppi_jj").checked
     };
-    const { ok, data } = await apiPost("/api/predict-ppi", payload);
-    if (!ok) { document.getElementById("ppiSummary").innerText = errText(data); return; }
+  }
+
+  function renderPPI(data) {
     setVerdict("ppi", data, { up: "HOTTER (USD BULLISH / GOLD BEARISH)", down: "COOLER (USD BEARISH / GOLD BULLISH)", flat: "NO-TRADE / LOW EDGE" });
     document.getElementById("ppiTier").innerText = data.tier;
     document.getElementById("ppiScore").innerText = `Score: ${data.score > 0 ? "+" : ""}${data.score} | Gate: ±${data.buffer}`;
     document.getElementById("ppiSummary").innerText = data.summary;
     document.getElementById("ppiPairs").innerHTML = pairRows(data.pairs);
+  }
+
+  async function calcPPI() {
+    const { ok, data } = await apiPost("/api/predict-ppi", { user_email: currentUser ? currentUser.email : "", ...ppiPayload() });
+    if (!ok) { document.getElementById("ppiSummary").innerText = errText(data); return; }
+    renderPPI(data);
   }
 
   async function decodePPI() {
@@ -1975,23 +2173,29 @@ def index():
     showDecode("ppiDecodeOut", ok ? data : { verdict: "Could not decode", plan: errText(data) });
   }
 
-  async function calcFOMC() {
+  function fomcPayload() {
     const val = id => Number(document.getElementById(id).value);
-    const payload = {
-      user_email: currentUser ? currentUser.email : "",
+    return {
       fedwatch_prob_pct: val("fomc_prob"),
       expected_move: document.getElementById("fomc_move").value,
       us2y_yield_5d_bps: val("fomc_us2y"),
       recent_core_cpi_surprise: val("fomc_cpi"),
       nfp_recent_edge: document.getElementById("fomc_nfp").value
     };
-    const { ok, data } = await apiPost("/api/predict-fomc", payload);
-    if (!ok) { document.getElementById("fomcSummary").innerText = errText(data); return; }
+  }
+
+  function renderFOMC(data) {
     setVerdict("fomc", data, { up: "HAWKISH LEAN (USD BULLISH / GOLD BEARISH)", down: "DOVISH LEAN (USD BEARISH / GOLD BULLISH)", flat: "NO-TRADE / INLINE HOLD" });
     document.getElementById("fomcTier").innerText = data.crowded ? "CROWDED CONSENSUS (BUY RUMOR / SELL FACT RISK)" : "";
     document.getElementById("fomcScore").innerText = `Hawkish score: ${data.score > 0 ? "+" : ""}${data.score} | Gate: ±${data.gate} | Reversal risk: ${data.reversal_risk}`;
     document.getElementById("fomcSummary").innerText = data.summary;
     document.getElementById("fomcPairs").innerHTML = pairRows(data.pairs);
+  }
+
+  async function calcFOMC() {
+    const { ok, data } = await apiPost("/api/predict-fomc", { user_email: currentUser ? currentUser.email : "", ...fomcPayload() });
+    if (!ok) { document.getElementById("fomcSummary").innerText = errText(data); return; }
+    renderFOMC(data);
   }
 
   async function decodeFOMC() {
@@ -2002,6 +2206,151 @@ def index():
       chair_presser_cue: document.getElementById("dec_fomc_chair").value
     });
     showDecode("fomcDecodeOut", ok ? data : { verdict: "Could not decode", plan: errText(data) });
+  }
+
+  let viewMode = "desk";
+  let signals = {};
+
+  const MODULE_LABELS = {
+    NFP:  { up: "USD BULLISH (BEAT / HOTTER)", down: "USD BEARISH (MISS / COOLER)", flat: "NO-TRADE / LOW EDGE" },
+    CPI:  { up: "USD BULLISH (BEAT / HOTTER)", down: "USD BEARISH (MISS / COOLER)", flat: "NO-TRADE / LOW EDGE" },
+    PPI:  { up: "HOTTER (USD BULLISH / GOLD BEARISH)", down: "COOLER (USD BEARISH / GOLD BULLISH)", flat: "NO-TRADE / LOW EDGE" },
+    FOMC: { up: "HAWKISH LEAN (USD BULLISH / GOLD BEARISH)", down: "DOVISH LEAN (USD BEARISH / GOLD BULLISH)", flat: "NO-TRADE / INLINE HOLD" }
+  };
+  const MODULE_API = { NFP: "/api/predict-nfp", CPI: "/api/predict-cpi", PPI: "/api/predict-ppi", FOMC: "/api/predict-fomc" };
+
+  function setMode(mode) {
+    viewMode = mode;
+    document.body.classList.toggle("client-mode", mode === "client");
+    const btn = document.getElementById("previewBtn");
+    if (btn) btn.innerText = mode === "client" ? "🛠️ Back to Desk Mode" : "👁️ Preview Client View";
+    if (mode === "client") loadSignals();
+  }
+
+  function togglePreview() {
+    setMode(viewMode === "client" ? "desk" : "client");
+  }
+
+  function fmtTime(iso) {
+    const t = new Date(iso);
+    return isNaN(t.getTime()) ? String(iso || "unknown") : t.toLocaleString();
+  }
+
+  function renderClientPanel(mod, failed) {
+    const p = mod.toLowerCase();
+    const badge = document.getElementById(p + "Badge");
+    const bias = document.getElementById(p + "CBias");
+    const sig = signals[mod];
+    if (failed || !sig || !sig.result) {
+      badge.innerText = "🏛️ A&M Group Research Desk — Official Pre-Release Signal";
+      bias.innerText = failed ? "COULD NOT LOAD" : "AWAITING DESK SIGNAL";
+      bias.className = "big-score neut";
+      document.getElementById(p + "CTier").innerText = "";
+      document.getElementById(p + "CScore").innerText = "";
+      document.getElementById(p + "CSummary").innerText = failed
+        ? "The latest desk signal could not be loaded. Tap Refresh Latest Desk Signal to try again."
+        : "The research desk has not published a forecast for this release yet. Tap Refresh Latest Desk Signal to check again.";
+      document.getElementById(p + "CPairs").innerHTML = "";
+      return;
+    }
+    const d = sig.result;
+    const sign = d.score > 0 ? "+" : "";
+    let metric = `Score: ${sign}${d.score}`;
+    if (mod === "NFP") metric = `Edge: ${sign}${d.score}K`;
+    if (mod === "PPI" && d.buffer !== undefined) metric += ` | Gate: ±${d.buffer}`;
+    if (mod === "FOMC") metric = `Hawkish score: ${sign}${d.score} | Gate: ±${d.gate} | Reversal risk: ${d.reversal_risk}`;
+    const L = MODULE_LABELS[mod];
+    const up = d.bias === "HOTTER" || d.bias === "HAWKISH";
+    const down = d.bias === "COOLER" || d.bias === "DOVISH";
+    badge.innerText = `🏛️ A&M Group Research Desk — Official Pre-Release Signal (Updated: ${fmtTime(sig.updated_at)})`;
+    bias.innerText = up ? L.up : down ? L.down : L.flat;
+    bias.className = "big-score " + (up ? "bull" : down ? "bear" : "neut");
+    document.getElementById(p + "CTier").innerText = d.tier || "";
+    document.getElementById(p + "CScore").innerText = metric;
+    document.getElementById(p + "CSummary").innerText = d.summary || "";
+    document.getElementById(p + "CPairs").innerHTML = Array.isArray(d.pairs) ? pairRows(d.pairs) : "";
+  }
+
+  async function loadSignals() {
+    let failed = false;
+    try {
+      const res = await fetch("/api/signals");
+      if (!res.ok) throw new Error("bad response");
+      const data = await res.json();
+      signals = data.signals || {};
+    } catch (e) {
+      failed = true;
+    }
+    ["NFP", "CPI", "PPI", "FOMC"].forEach(m => renderClientPanel(m, failed));
+    // The post-release NFP decoder needs the official consensus that the hidden input card normally supplies.
+    const nfp = signals.NFP;
+    if (!failed && currentUser && !currentUser.is_admin && nfp && nfp.inputs && nfp.inputs.consensus_nfp !== undefined) {
+      document.getElementById("nfp_cons").value = nfp.inputs.consensus_nfp;
+    }
+  }
+
+  function nfpPayload() {
+    const val = id => Number(document.getElementById(id).value);
+    return {
+      consensus_nfp: val("nfp_cons"),
+      net_strike_weather_adj: val("nfp_strike"),
+      icsa_change_k: val("nfp_icsa"),
+      ccsa_change_k: val("nfp_ccsa"),
+      ism_services_emp: val("nfp_isms"),
+      ism_services_prev: val("nfp_isms_p"),
+      adp_actual: val("nfp_adp"),
+      adp_consensus: val("nfp_adp_c"),
+      homebase_hours_pct: val("nfp_hb"),
+      labor_diff_change: val("nfp_labor"),
+      ism_mfg_emp: val("nfp_ismm"),
+      ism_mfg_prev: val("nfp_ismm_p"),
+      nfib_hiring_actual: val("nfp_nfib"),
+      nfib_hiring_prev: val("nfp_nfib_p"),
+      prev_govt_edu_swing: val("nfp_edu"),
+      is_summer_school_month: document.getElementById("nfp_summer").checked
+    };
+  }
+
+  function cpiPayload() {
+    const val = id => Number(document.getElementById(id).value);
+    return {
+      cpi_mom_consensus: val("cpi_cons"),
+      cleveland_nowcast_mom: val("cpi_clev"),
+      gas_oil_pct_change: val("cpi_gas"),
+      ppi_surprise_mom: val("cpi_ppi"),
+      ism_srv_prices: val("cpi_srvp"),
+      ism_srv_prices_prev: val("cpi_srvp_p"),
+      ism_mfg_prices: val("cpi_mfgp"),
+      ism_mfg_prices_prev: val("cpi_mfgp_p"),
+      manheim_used_car_pct: val("cpi_manheim"),
+      rent_index_pct: val("cpi_rent"),
+      nfib_price_plans: val("cpi_nfib")
+    };
+  }
+
+  function payloadFor(mod) {
+    return { NFP: nfpPayload, CPI: cpiPayload, PPI: ppiPayload, FOMC: fomcPayload }[mod]();
+  }
+
+  async function publishSignal(mod) {
+    const status = document.getElementById(mod.toLowerCase() + "PubStatus");
+    if (!confirm(`Publish this ${mod} forecast to all clients? It replaces the current official ${mod} signal.`)) return;
+    status.innerText = "Calculating and publishing...";
+    try {
+      const inputs = payloadFor(mod);
+      const calc = await apiPost(MODULE_API[mod], { user_email: currentUser.email, ...inputs });
+      if (!calc.ok) { status.innerText = "Could not calculate: " + errText(calc.data); return; }
+      if (mod === "NFP") renderForecast("nfp", calc.data, true);
+      if (mod === "CPI") renderForecast("cpi", calc.data, false);
+      if (mod === "PPI") renderPPI(calc.data);
+      if (mod === "FOMC") renderFOMC(calc.data);
+      const pub = await apiPost("/api/admin/publish-signal", { module: mod, inputs, result: calc.data, updated_at: new Date().toISOString() });
+      if (!pub.ok) { status.innerText = "Publish failed: " + errText(pub.data); return; }
+      const where = pub.data.storage && !pub.data.storage.includes("Permanent") ? " WARNING: saved only to temporary storage (" + pub.data.storage + ")." : "";
+      status.innerText = `✅ Published to clients (${fmtTime(pub.data.updated_at)}).${where}`;
+    } catch (e) {
+      status.innerText = "Publish failed. Check your connection and try again.";
+    }
   }
 
   if (currentUser) {
