@@ -1289,6 +1289,501 @@ def get_signals(response: Response, user: str = Depends(current_user)):
                            "updated_at": item.get("updated_at"), "inputs": inputs}
     return {"signals": signals}
 
+# ---------------------------------------------------------------------------
+# GBP V2 + EUR V2 predictors and post-release decoders
+# ---------------------------------------------------------------------------
+def _clamp(v):
+    return max(-1.0, min(1.0, v))
+
+def _gate_verdict(score, buffer, reason, subject, bull_text, bear_text):
+    """Shared V2 guardrail. Returns (bias, bias_dir, mult, verdict, tier, summary)."""
+    if abs(score) < buffer:
+        verdict = "NO-TRADE / LOW EDGE"
+        return ("NEUTRAL", 0, 0.55, verdict,
+                f"NO-TRADE / LOW EDGE (±{buffer:g} gate: {reason})",
+                f"Score {score:+.1f} is inside the ±{buffer:g} gate ({reason}). Skip the {subject} spike and wait for the print.")
+    strong = abs(score) >= buffer + 20
+    mult = 1.2 if strong else 0.9
+    prefix = "TIER 1 " if strong else "TIER 2 "
+    if score > 0:
+        verdict = bull_text
+        return ("HOTTER", 1, mult, verdict, prefix + verdict,
+                f"{subject} proxies lean above consensus (score {score:+.1f} vs ±{buffer:g} gate; {reason}). {bull_text}.")
+    verdict = bear_text
+    return ("COOLER", -1, mult, verdict, prefix + verdict,
+            f"{subject} proxies lean below consensus (score {score:+.1f} vs ±{buffer:g} gate; {reason}). {bear_text}.")
+
+def _v2_payload(score, buffer, reason, bias, verdict, tier, summary, assets, bias_dir, mult, extra=None):
+    out = {"score": score, "bias": bias, "verdict": verdict, "tier": tier,
+           "confidence": min(85, round(50 + abs(score) * 0.44)),
+           "buffer": buffer, "buffer_reason": reason, "summary": summary,
+           "pairs": _spike_rows(assets, bias_dir, mult, "NO-TRADE / LOW EDGE")}
+    if extra:
+        out.update(extra)
+    return out
+
+# ----- GBP -----
+class GBP_CPIInput(BaseModel):
+    user_email: str
+    uk_cpi_consensus: float = 2.4
+    uk_srv_pmi_prices: float = 57.5
+    uk_srv_pmi_prices_prev: float = 56.0
+    brc_shop_price_yoy: float = 1.8
+    brc_shop_price_prev: float = 1.5
+    uk_input_ppi_mom: float = 0.3
+    kantar_grocery_yoy: float = 2.6
+    kantar_grocery_prev: float = 2.3
+    uk_gas_petrol_pct: float = 3.5
+    rec_starting_salaries: float = 53.0
+    is_ofgem_reset_month: bool = False
+
+class GBP_JobsInput(BaseModel):
+    user_email: str
+    boe_dmp_wage_exp: float = 4.2
+    rec_starting_salaries: float = 53.5
+    rec_starting_salaries_prev: float = 52.0
+    rec_placements_idx: float = 48.5
+    rec_placements_prev: float = 47.0
+    uk_pmi_emp: float = 50.8
+    uk_pmi_emp_prev: float = 49.9
+    hmrc_paye_change_k: float = 15.0
+    adzuna_job_ads_pct: float = 1.2
+
+class DecodeGBPReq(BaseModel):
+    event_type: str
+    headline_forecast: float
+    headline_actual: float
+    core_or_wages_forecast: float
+    core_or_wages_actual: float
+
+@app.post("/api/predict-gbp-cpi")
+def predict_gbp_cpi(data: GBP_CPIInput, user: str = Depends(require_admin)):
+    check_numbers(data)
+    increment_usage(user)
+    sig_srv = _clamp(((data.uk_srv_pmi_prices - data.uk_srv_pmi_prices_prev) + ((data.uk_srv_pmi_prices - 55.0) * 0.3)) / 4.0)
+    sig_brc = _clamp(((data.brc_shop_price_yoy - data.brc_shop_price_prev) + ((data.brc_shop_price_yoy - 1.5) * 0.5)) / 1.5)
+    sig_ppi = _clamp((data.uk_input_ppi_mom - 0.1) / 0.5)
+    sig_kan = _clamp(((data.kantar_grocery_yoy - data.kantar_grocery_prev) + ((data.kantar_grocery_yoy - 2.5) * 0.5)) / 1.5)
+    sig_gas = _clamp(data.uk_gas_petrol_pct / 8.0)
+    sig_sal = _clamp((data.rec_starting_salaries - 50.0) / 5.0)
+
+    score = round((sig_srv * 30) + (sig_brc * 25) + (sig_ppi * 20) + (sig_kan * 10) + (sig_gas * 8) + (sig_sal * 7), 1)
+    buffer = 35.0 if data.is_ofgem_reset_month else 25.0
+    reason = "Ofgem energy-cap reset month" if data.is_ofgem_reset_month else "standard gate"
+    bias, bias_dir, mult, verdict, tier, summary = _gate_verdict(
+        score, buffer, reason, "UK CPI",
+        "HOTTER UK CPI (GBP BULLISH): lean GBP up on BoE services-inflation repricing",
+        "COOLER UK CPI (GBP BEARISH): lean GBP down as BoE cut pricing builds")
+    assets = [
+        {"pair": "GBP/JPY", "base": 135, "inv": False, "note": "Highest-beta GBP cross; let the first 2 minutes of spread settle"},
+        {"pair": "GBP/USD", "base": 95,  "inv": False, "note": "Cleanest read of BoE rate-path repricing; wait for the 5m candle"},
+        {"pair": "EUR/GBP", "base": 55,  "inv": True,  "note": "Inverse leg: a hot UK print pushes EUR/GBP lower; thin liquidity, wide spreads"},
+    ]
+    return _v2_payload(score, buffer, reason, bias, verdict, tier, summary, assets, bias_dir, mult)
+
+@app.post("/api/predict-gbp-jobs")
+def predict_gbp_jobs(data: GBP_JobsInput, user: str = Depends(require_admin)):
+    check_numbers(data)
+    increment_usage(user)
+    sig_dmp = _clamp((data.boe_dmp_wage_exp - 4.0) / 1.0)
+    sig_sal = _clamp(((data.rec_starting_salaries - data.rec_starting_salaries_prev) + ((data.rec_starting_salaries - 50.0) * 0.5)) / 3.0)
+    plc_delta = data.rec_placements_idx - data.rec_placements_prev
+    sig_plc = _clamp((plc_delta + ((data.rec_placements_idx - 50.0) * 0.5)) / 3.0)
+    sig_pmi = _clamp(((data.uk_pmi_emp - data.uk_pmi_emp_prev) + ((data.uk_pmi_emp - 50.0) * 0.5)) / 2.5)
+    sig_paye = _clamp(data.hmrc_paye_change_k / 50.0)
+    sig_adz = _clamp(data.adzuna_job_ads_pct / 3.0)
+
+    score = round((sig_dmp * 20) + (sig_sal * 15) + (sig_plc * 25) + (sig_pmi * 20) + (sig_paye * 12) + (sig_adz * 8), 1)
+
+    # V2 guardrail: LFS divergence filter (HMRC PAYE vs REC placements pointing opposite ways)
+    lfs_divergence = (data.hmrc_paye_change_k * plc_delta) < 0
+    buffer = 32.0 if lfs_divergence else 25.0
+    reason = "LFS divergence: HMRC PAYE and REC placements disagree" if lfs_divergence else "standard gate"
+    bias, bias_dir, mult, verdict, tier, summary = _gate_verdict(
+        score, buffer, reason, "UK labour-market",
+        "HAWKISH WAGE-LED JOBS (GBP BULLISH): lean GBP up",
+        "SOFT WAGE-LED JOBS (GBP BEARISH): lean GBP down")
+    assets = [
+        {"pair": "GBP/JPY", "base": 110, "inv": False, "note": "Wage prints move BoE pricing; wait for the first 5m candle"},
+        {"pair": "GBP/USD", "base": 75,  "inv": False, "note": "Follows UK 2Y gilt repricing after the print"},
+        {"pair": "EUR/GBP", "base": 45,  "inv": True,  "note": "Inverse leg; low liquidity around the 7:00 UK release"},
+    ]
+    return _v2_payload(score, buffer, reason, bias, verdict, tier, summary, assets, bias_dir, mult,
+                       {"lfs_divergence": lfs_divergence})
+
+# ----- shared divergence classifier for the decoders -----
+def _classify(h, c, thr):
+    """h / c are signed so that positive = bullish for the currency. Headline = h, Core/Services/Wages = c."""
+    if h <= -thr and c >= thr:
+        return "TRAP_BULL"
+    if h >= thr and c <= -thr:
+        return "TRAP_BEAR"
+    if c >= thr and h >= 0:
+        return "CLEAN_BULL"
+    if c <= -thr and h <= 0:
+        return "CLEAN_BEAR"
+    return "FLAT"
+
+GBP_DECODER_TEXT = {
+    "UK_CPI": {
+        "TRAP_BULL": ("UK SERVICES CPI DIVERGENCE TRAP (HEADLINE MISS, SERVICES BEAT)",
+            "Headline CPI missed but Services CPI, the BoE's focus, beat. The first dip is a trap. "
+            "GBP/USD: fade the initial dip and BUY once a 5-minute candle closes back above the pre-news level. "
+            "GBP/JPY: same plan, BUY the failed breakdown. EUR/GBP: SELL a failed push higher."),
+        "TRAP_BEAR": ("UK FALSE SPIKE TRAP (HEADLINE HOT, SERVICES COOL)",
+            "Headline beat but Services CPI missed, so the BoE is unlikely to turn hawkish. "
+            "GBP/USD and GBP/JPY: fade the initial rally and SELL a failed 5-minute breakout. EUR/GBP: BUY the first dip."),
+        "CLEAN_BULL": ("HOT SERVICES & HEADLINE CPI — GBP BULLISH",
+            "Sticky services inflation cuts BoE easing hopes. BUY GBP/USD and GBP/JPY on the first 5-minute pullback; SELL EUR/GBP on bounces."),
+        "CLEAN_BEAR": ("COOL SERVICES & HEADLINE CPI — GBP BEARISH",
+            "Disinflation confirmed in services. SELL GBP/USD and GBP/JPY on the first 5-minute pullback; BUY EUR/GBP on dips."),
+        "FLAT": ("INLINE / MIXED UK CPI — STAND ASIDE",
+            "Headline and services offset or matched consensus. Expect two-way wicks in GBP/USD and GBP/JPY; skip it and keep capital for the next release."),
+    },
+    "UK_JOBS": {
+        "TRAP_BULL": ("UK WAGE DIVERGENCE TRAP (JOBS MISS, WAGES BEAT)",
+            "Headline labour data was weak but 3M YoY wage growth beat, which is what the BoE watches. "
+            "GBP/USD: fade the initial dip and BUY after the 5-minute candle closes back above the pre-news level. "
+            "GBP/JPY: same plan. EUR/GBP: SELL a failed push higher."),
+        "TRAP_BEAR": ("UK STRONG-HEADLINE / WEAK-WAGE TRAP",
+            "Headline labour data beat but wage growth missed, so BoE hawkishness is not supported. "
+            "GBP/USD and GBP/JPY: fade the initial rally and SELL a failed 5-minute breakout. EUR/GBP: BUY the first dip."),
+        "CLEAN_BULL": ("STRONG JOBS & WAGES — GBP BULLISH",
+            "Labour market and wages both firm. BUY GBP/USD and GBP/JPY on the first 5-minute pullback; SELL EUR/GBP on bounces."),
+        "CLEAN_BEAR": ("WEAK JOBS & WAGES — GBP BEARISH",
+            "Labour market and wages both soft. SELL GBP/USD and GBP/JPY on the first 5-minute pullback; BUY EUR/GBP on dips."),
+        "FLAT": ("INLINE / MIXED UK JOBS PRINT — STAND ASIDE",
+            "Headline and wages offset or matched consensus. Skip GBP pairs and wait for the next release."),
+    },
+}
+
+@app.post("/api/decode-gbp")
+def decode_gbp(d: DecodeGBPReq, user: str = Depends(current_user)):
+    check_numbers(d)
+    ev = d.event_type.strip().upper()
+    if ev not in GBP_DECODER_TEXT:
+        raise HTTPException(status_code=422, detail="'event_type' must be UK_CPI or UK_JOBS.")
+    head_diff = round(d.headline_actual - d.headline_forecast, 2)
+    core_diff = round(d.core_or_wages_actual - d.core_or_wages_forecast, 2)
+    # For UK_JOBS the headline is the unemployment rate, where a HIGHER number is weaker for GBP.
+    h = -head_diff if ev == "UK_JOBS" else head_diff
+    scenario = _classify(h, core_diff, 0.1)
+    verdict, plan = GBP_DECODER_TEXT[ev][scenario]
+    return {"verdict": verdict, "plan": plan}
+
+# ----- EUR -----
+class EUR_CPIInput(BaseModel):
+    user_email: str
+    eur_cpi_consensus: float = 2.1
+    german_states_weighted_cpi: float = 2.3
+    spain_france_flash_surprise: float = 0.1
+    ttf_gas_brent_pct: float = 4.0
+    hcob_srv_pmi_prices: float = 55.2
+    hcob_srv_pmi_prices_prev: float = 54.0
+    german_import_ppi_mom: float = 0.2
+    is_eu_summer_travel: bool = False
+
+class EUR_PMIInput(BaseModel):
+    user_email: str
+    eur_comp_pmi_consensus: float = 50.5
+    german_flash_pmi: float = 51.4
+    french_flash_pmi: float = 50.8
+    zew_sentix_change: float = 3.5
+    eur_new_orders_subidx: float = 51.0
+
+class DecodeEURReq(BaseModel):
+    event_type: str
+    headline_forecast: float
+    headline_actual: float
+    core_or_services_forecast: float
+    core_or_services_actual: float
+
+@app.post("/api/predict-eur-cpi")
+def predict_eur_cpi(data: EUR_CPIInput, user: str = Depends(require_admin)):
+    check_numbers(data)
+    increment_usage(user)
+    sig_ger = _clamp((data.german_states_weighted_cpi - data.eur_cpi_consensus) / 0.3)
+    sig_sf = _clamp(data.spain_france_flash_surprise / 0.2)
+    sig_ttf = _clamp(data.ttf_gas_brent_pct / 8.0)
+    sig_srv = _clamp(((data.hcob_srv_pmi_prices - data.hcob_srv_pmi_prices_prev) + ((data.hcob_srv_pmi_prices - 55.0) * 0.3)) / 4.0)
+    sig_imp = _clamp(data.german_import_ppi_mom / 0.4)
+
+    score = round((sig_ger * 45) + (sig_sf * 25) + (sig_ttf * 15) + (sig_srv * 10) + (sig_imp * 5), 1)
+    buffer = 33.0 if data.is_eu_summer_travel else 25.0
+    reason = "July–August package-holiday / transport window" if data.is_eu_summer_travel else "standard gate"
+    bias, bias_dir, mult, verdict, tier, summary = _gate_verdict(
+        score, buffer, reason, "Eurozone flash CPI",
+        "HOTTER EZ CPI (EUR BULLISH): lean EUR up on ECB hawkish repricing",
+        "COOLER EZ CPI (EUR BEARISH): lean EUR down as ECB easing bets build")
+    assets = [
+        {"pair": "EUR/JPY", "base": 105, "inv": False, "note": "High-beta EUR cross; wait 2 minutes for spreads to normalise"},
+        {"pair": "EUR/USD", "base": 78,  "inv": False, "note": "Cleanest follow-through after the 5m candle closes"},
+        {"pair": "EUR/GBP", "base": 50,  "inv": False, "note": "Slower mover; confirm the direction on EUR/USD first"},
+    ]
+    return _v2_payload(score, buffer, reason, bias, verdict, tier, summary, assets, bias_dir, mult)
+
+@app.post("/api/predict-eur-pmi")
+def predict_eur_pmi(data: EUR_PMIInput, user: str = Depends(require_admin)):
+    check_numbers(data)
+    increment_usage(user)
+    cons = data.eur_comp_pmi_consensus
+    sig_ger = _clamp((data.german_flash_pmi - cons) / 1.5)
+    sig_fr = _clamp((data.french_flash_pmi - cons) / 1.5)
+    sig_zew = _clamp(data.zew_sentix_change / 10.0)
+    sig_no = _clamp((data.eur_new_orders_subidx - 50.0) / 3.0)
+
+    score = round((sig_ger * 40) + (sig_fr * 25) + (sig_zew * 20) + (sig_no * 15), 1)
+
+    # V2 guardrail: Franco-German divergence gate
+    divergence = (abs(data.german_flash_pmi - data.french_flash_pmi) >= 2.5
+                  and (data.german_flash_pmi - 50.0) * (data.french_flash_pmi - 50.0) < 0)
+    buffer = 36.0 if divergence else 25.0
+    reason = "Franco-German PMIs sit on opposite sides of 50" if divergence else "standard gate"
+    bias, bias_dir, mult, verdict, tier, summary = _gate_verdict(
+        score, buffer, reason, "Eurozone flash PMI",
+        "STRONGER EZ PMI (EUR BULLISH): lean EUR up",
+        "WEAKER EZ PMI (EUR BEARISH): lean EUR down")
+    assets = [
+        {"pair": "EUR/JPY", "base": 80, "inv": False, "note": "Risk-sensitive; moves with the equity reaction to the PMI"},
+        {"pair": "EUR/USD", "base": 60, "inv": False, "note": "Wait for the first 5m candle; PMI spikes often fade"},
+        {"pair": "EUR/GBP", "base": 40, "inv": False, "note": "Low volatility; trade only if EUR/USD confirms"},
+    ]
+    return _v2_payload(score, buffer, reason, bias, verdict, tier, summary, assets, bias_dir, mult,
+                       {"franco_german_divergence": divergence})
+
+EUR_DECODER_TEXT = {
+    "EUR_CPI": {
+        "TRAP_BULL": ("CORE CPI DIVERGENCE TRAP (HEADLINE MISS, CORE BEAT)",
+            "Headline flash CPI missed but Core beat, and the ECB watches Core. The first dip is a trap. "
+            "EUR/USD: fade the dip and BUY after a 5-minute close back above the pre-news level. "
+            "EUR/JPY: BUY the failed breakdown. EUR/GBP: BUY the first 5-minute pullback, but only if EUR/USD has already recovered."),
+        "TRAP_BEAR": ("FALSE SPIKE TRAP (HEADLINE HOT, CORE COOL)",
+            "Headline beat but Core missed, so the ECB is unlikely to turn hawkish. "
+            "EUR/USD: fade the initial rally and SELL a failed 5-minute breakout. EUR/JPY: same plan. EUR/GBP: SELL the first failed push higher."),
+        "CLEAN_BULL": ("HOT CORE & HEADLINE CPI — EUR BULLISH",
+            "Sticky core inflation trims ECB easing bets. BUY EUR/USD, EUR/JPY and EUR/GBP on the first 5-minute pullback."),
+        "CLEAN_BEAR": ("COOL CORE & HEADLINE CPI — EUR BEARISH",
+            "Disinflation confirmed in Core. SELL EUR/USD, EUR/JPY and EUR/GBP on the first 5-minute pullback."),
+        "FLAT": ("INLINE / MIXED EZ CPI — STAND ASIDE",
+            "Headline and core offset or matched consensus. Expect two-way wicks on EUR/USD, EUR/JPY and EUR/GBP; preserve capital."),
+    },
+    "EUR_PMI": {
+        "TRAP_BULL": ("SERVICES PMI DIVERGENCE TRAP (COMPOSITE MISS, SERVICES BEAT)",
+            "Composite flash PMI missed but Services PMI beat; services drive Eurozone growth and inflation. "
+            "EUR/USD: fade the dip and BUY after the 5-minute candle closes back above the pre-news level. "
+            "EUR/JPY: BUY the failed breakdown. EUR/GBP: BUY only after EUR/USD confirms."),
+        "TRAP_BEAR": ("MANUFACTURING-LED FALSE SPIKE (COMPOSITE BEAT, SERVICES MISS)",
+            "Composite beat but Services PMI missed, so the strength is narrow. "
+            "EUR/USD and EUR/JPY: fade the initial rally and SELL a failed 5-minute breakout. EUR/GBP: SELL the first failed push higher."),
+        "CLEAN_BULL": ("STRONG COMPOSITE & SERVICES PMI — EUR BULLISH",
+            "Broad-based strength. BUY EUR/USD, EUR/JPY and EUR/GBP on the first 5-minute pullback; PMI reactions fade quickly, so keep size modest."),
+        "CLEAN_BEAR": ("WEAK COMPOSITE & SERVICES PMI — EUR BEARISH",
+            "Broad-based weakness. SELL EUR/USD, EUR/JPY and EUR/GBP on the first 5-minute pullback; keep size modest."),
+        "FLAT": ("INLINE / MIXED EZ PMI — STAND ASIDE",
+            "Composite and services offset or matched consensus. Skip EUR pairs and wait for the next release."),
+    },
+}
+
+@app.post("/api/decode-eur")
+def decode_eur(d: DecodeEURReq, user: str = Depends(current_user)):
+    check_numbers(d)
+    ev = d.event_type.strip().upper()
+    if ev not in EUR_DECODER_TEXT:
+        raise HTTPException(status_code=422, detail="'event_type' must be EUR_CPI or EUR_PMI.")
+    head_diff = round(d.headline_actual - d.headline_forecast, 2)
+    core_diff = round(d.core_or_services_actual - d.core_or_services_forecast, 2)
+    thr = 0.5 if ev == "EUR_PMI" else 0.1  # PMI points vs CPI percentage points
+    verdict, plan = EUR_DECODER_TEXT[ev][_classify(head_diff, core_diff, thr)]
+    return {"verdict": verdict, "plan": plan}
+
+# ---------------------------------------------------------------------------
+# Next-event queue: the admin schedules signals, clients only see what is next
+# (stored in site_settings under setting_key = "active_calendar_events")
+# ---------------------------------------------------------------------------
+EVENTS_KEY = "active_calendar_events"
+EVENT_MODULES = {"USD": ("NFP", "CPI", "PPI", "FOMC"), "GBP": ("CPI", "JOBS"), "EUR": ("CPI", "PMI")}
+EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{3,64}$")
+EVENT_WINDOW_SECONDS = 2 * 3600       # keep an event visible this long after its release
+EVENT_ARCHIVE_SECONDS = 7 * 86400     # events older than this are dropped when the admin next publishes
+MAX_EVENTS = 40
+MAX_EVENTS_CHARS = 400_000
+# Clients only receive the inputs the post-release decoder needs (the consensus), never the proxy inputs.
+PUBLIC_EVENT_INPUT_KEYS = {
+    "USD_NFP": ("consensus_nfp",), "USD_CPI": ("cpi_mom_consensus",), "USD_PPI": ("ppi_mom_consensus",),
+    "GBP_CPI": ("uk_cpi_consensus",), "EUR_CPI": ("eur_cpi_consensus",), "EUR_PMI": ("eur_comp_pmi_consensus",),
+}
+_EVENTS_LOCK = threading.Lock()
+
+class PublishEventReq(BaseModel):
+    event_id: str
+    currency: str
+    title: str
+    release_utc: str
+    inputs: dict = {}
+    result: dict = {}
+    active: bool = True
+
+def _parse_release(text: str) -> datetime:
+    try:
+        return datetime.strptime(str(text).strip(), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="'release_utc' must look like 2026-12-04T13:30:00Z.")
+
+def _event_module(event_id: str, currency: str) -> str:
+    parts = event_id.split("_")
+    if len(parts) < 2 or parts[0].upper() != currency or parts[1].upper() not in EVENT_MODULES[currency]:
+        raise HTTPException(status_code=422, detail=f"'event_id' must start with {currency}_ followed by one of: {', '.join(EVENT_MODULES[currency])} (e.g. {currency}_{EVENT_MODULES[currency][0]}).")
+    return parts[1].upper()
+
+def _read_events(cur, ph) -> dict:
+    cur.execute(f"SELECT setting_value FROM site_settings WHERE setting_key = {ph}", (EVENTS_KEY,))
+    row = cur.fetchone()
+    if not row:
+        return {}
+    try:
+        data = json.loads(row["setting_value"])
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def _write_events(conn, cur, events: dict):
+    text = json.dumps(events, separators=(",", ":"))
+    if len(text) > MAX_EVENTS_CHARS:
+        raise HTTPException(status_code=413, detail="The event queue is too large. Remove some events first.")
+    if is_pg(conn):
+        cur.execute(
+            "INSERT INTO site_settings (setting_key, setting_value) VALUES (%s, %s) "
+            "ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value",
+            (EVENTS_KEY, text)
+        )
+    else:
+        cur.execute("INSERT OR REPLACE INTO site_settings (setting_key, setting_value) VALUES (?, ?)", (EVENTS_KEY, text))
+
+@app.post("/api/admin/publish-event")
+def publish_event(req: PublishEventReq, admin: str = Depends(require_admin)):
+    currency = req.currency.strip().upper()
+    if currency not in EVENT_MODULES:
+        raise HTTPException(status_code=422, detail="'currency' must be USD, GBP or EUR.")
+    event_id = req.event_id.strip()
+    if not EVENT_ID_RE.match(event_id):
+        raise HTTPException(status_code=422, detail="'event_id' may only use letters, numbers, _ and - (3 to 64 characters).")
+    module = _event_module(event_id, currency)
+    title = req.title.strip()
+    if not 1 <= len(title) <= 120:
+        raise HTTPException(status_code=422, detail="'title' must be 1 to 120 characters.")
+    release = _parse_release(req.release_utc)
+    result = req.result
+    pairs = result.get("pairs")
+    if not ({"bias", "score", "summary"} <= set(result) and isinstance(pairs, list)
+            and all(isinstance(p, dict) for p in pairs)):
+        raise HTTPException(status_code=422, detail="'result' is not a valid forecast. Calculate it first, then publish.")
+    record = {
+        "event_id": event_id, "currency": currency, "module": module, "title": title,
+        "release_utc": release.strftime("%Y-%m-%dT%H:%M:%SZ"), "active": bool(req.active),
+        "inputs": {k: v for k, v in req.inputs.items() if k != "user_email"},
+        "result": result, "updated_at": _utc_iso(),  # server-stamped so it cannot be back-dated
+    }
+    now = datetime.now(timezone.utc)
+    with _EVENTS_LOCK:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            events = _read_events(cur, ph_for(conn))
+            for key in list(events):
+                try:
+                    old = _parse_release(events[key].get("release_utc", ""))
+                except Exception:
+                    del events[key]
+                    continue
+                if (now - old).total_seconds() > EVENT_ARCHIVE_SECONDS:
+                    del events[key]
+            if event_id not in events and len(events) >= MAX_EVENTS:
+                raise HTTPException(status_code=409, detail="The queue already holds the maximum number of events. Remove one first.")
+            events[event_id] = record
+            _write_events(conn, cur, events)
+            conn.commit()
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception as e:
+            conn.rollback()
+            log.exception("Publishing event failed")
+            raise HTTPException(status_code=500, detail=f"Could not publish the event: {_first_line(e)}")
+        finally:
+            cur.close()
+            conn.close()
+    log.info("Calendar event published: %s at %s", event_id, record["release_utc"])
+    return {"status": "ok", "event_id": event_id, "release_utc": record["release_utc"],
+            "updated_at": record["updated_at"], "storage": DB_STATUS_MSG}
+
+@app.delete("/api/admin/publish-event/{event_id}")
+def remove_event(event_id: str, admin: str = Depends(require_admin)):
+    with _EVENTS_LOCK:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            events = _read_events(cur, ph_for(conn))
+            if event_id not in events:
+                raise HTTPException(status_code=404, detail="That event is not in the queue.")
+            del events[event_id]
+            _write_events(conn, cur, events)
+            conn.commit()
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception as e:
+            conn.rollback()
+            log.exception("Removing event failed")
+            raise HTTPException(status_code=500, detail=f"Could not remove the event: {_first_line(e)}")
+        finally:
+            cur.close()
+            conn.close()
+    log.info("Calendar event removed: %s", event_id)
+    return {"status": "ok", "event_id": event_id}
+
+@app.get("/api/next-events")
+def next_events(request: Request, response: Response, user: str = Depends(current_user)):
+    """Clients get only the earliest upcoming date's events. The admin can add ?all=1 for the full queue manager."""
+    response.headers["Cache-Control"] = "no-store"
+    is_admin = user == ADMIN_EMAIL
+    want_all = is_admin and request.query_params.get("all") == "1"
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        events = _read_events(cur, ph_for(conn))
+    finally:
+        cur.close()
+        conn.close()
+    now = datetime.now(timezone.utc)
+    rows = []
+    for ev in events.values():
+        try:
+            release = _parse_release(ev.get("release_utc", ""))
+        except Exception:
+            continue
+        rows.append((release, ev))
+    rows.sort(key=lambda r: (r[0], r[1].get("event_id", "")))
+
+    def shape(ev):
+        inputs = ev.get("inputs") or {}
+        if not want_all:
+            keep = PUBLIC_EVENT_INPUT_KEYS.get(f"{ev.get('currency')}_{ev.get('module')}", ())
+            inputs = {k: inputs[k] for k in keep if k in inputs}
+        return {"event_id": ev.get("event_id"), "currency": ev.get("currency"), "module": ev.get("module"),
+                "title": ev.get("title"), "release_utc": ev.get("release_utc"), "active": ev.get("active", True),
+                "updated_at": ev.get("updated_at"), "result": ev.get("result"), "inputs": inputs}
+
+    server_time = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if want_all:
+        return {"server_time": server_time, "events": [shape(ev) for _, ev in rows]}
+    live = [(r, ev) for r, ev in rows
+            if ev.get("active") and (now - r).total_seconds() <= EVENT_WINDOW_SECONDS]
+    if not live:
+        return {"server_time": server_time, "next_date": None, "events": []}
+    next_date = live[0][0].strftime("%Y-%m-%d")
+    todays = [shape(ev) for r, ev in live if r.strftime("%Y-%m-%d") == next_date]
+    return {"server_time": server_time, "next_date": next_date, "events": todays}
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """<!DOCTYPE html>
@@ -1350,6 +1845,22 @@ def index():
   .source-guide ul { margin-top: 0.6rem; padding-left: 1.1rem; color: var(--muted); }
   .source-guide li { margin-bottom: 0.35rem; }
   .source-guide a { color: var(--gold); text-decoration: underline; }
+  .countdown { font-size: 1.15rem; font-weight: 800; color: var(--gold-bright); background: #04140f; border: 1px solid var(--gold); border-radius: 8px; padding: 0.7rem 0.9rem; margin-bottom: 0.9rem; text-align: center; letter-spacing: 0.5px; font-variant-numeric: tabular-nums; }
+  .countdown.live { color: #fff; background: #7f1d1d; border-color: var(--red); animation: pulse 1.4s infinite; }
+  @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.7; } 100% { opacity: 1; } }
+  .btn-publish { width: 100%; padding: 0.85rem 1rem; font-size: 1rem; background: linear-gradient(135deg, #f3cf65, #d4af37 55%, #b58e22); box-shadow: 0 0 0 2px rgba(243,207,101,0.35), 0 6px 18px rgba(212,175,55,0.25); }
+  .cur-filter { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.9rem; }
+  .cur-chip { padding: 0.5rem 1rem; border-radius: 999px; border: 1px solid var(--border); background: var(--card); color: var(--muted); font-weight: 800; cursor: pointer; font-size: 0.85rem; }
+  .cur-chip.active { border-color: var(--gold); color: var(--gold-bright); background: #04140f; }
+  .pill { display: inline-block; padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 0.72rem; font-weight: 800; border: 1px solid var(--border); }
+  .pill.up { color: var(--gold-bright); border-color: var(--gold); }
+  .pill.live { color: #fff; background: #7f1d1d; border-color: var(--red); }
+  .pill.done { color: var(--muted); }
+  .sched-box { border-color: var(--gold); }
+  .sched-box input[type="datetime-local"] { width: 100%; background: #04140f; border: 1px solid var(--border); color: #fff; padding: 0.5rem; border-radius: 6px; font-size: 0.9rem; color-scheme: dark; }
+  #clientQueue { display: none; }
+  .client-mode #clientQueue { display: block; }
+  .client-mode .grid, .client-mode #tabsRow, .client-mode #curFilter, .client-mode #fetchStatus { display: none !important; }
 </style>
 </head>
 <body>
@@ -1418,8 +1929,19 @@ def index():
       </table>
     </div>
 
-    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.75rem; margin-bottom:1.25rem;">
-      <div class="tabs" style="margin:0;">
+    <div class="card desk-only" id="queueCard">
+      <h2><span>📡 Active Next-Event Client Queue</span> <button class="btn-outline" onclick="loadQueue()">🔄 Refresh</button></h2>
+      <p style="font-size:0.8rem; color:var(--muted); margin-bottom:0.75rem;">Clients only ever see the earliest scheduled date. An event stays visible for 2 hours after its release (the decoder window), then drops off automatically.</p>
+      <div style="overflow-x:auto;"><table>
+        <thead><tr><th>Event</th><th>Release (local)</th><th>Release (UTC)</th><th>Status</th><th></th></tr></thead>
+        <tbody id="queueBody"></tbody>
+      </table></div>
+    </div>
+
+    <div id="curFilter" class="cur-filter desk-only"></div>
+
+    <div id="tabsRow" class="desk-only" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.75rem; margin-bottom:1.25rem;">
+      <div class="tabs" id="tabsBox" style="margin:0;">
         <button class="tab active" id="tabNFP" onclick="switchTab('NFP')">🇺🇸 NFP V2 Predictor</button>
         <button class="tab" id="tabCPI" onclick="switchTab('CPI')">🔥 CPI Predictor</button>
         <button class="tab" id="tabPPI" onclick="switchTab('PPI')">🏭 PPI V2 Predictor</button>
@@ -1500,8 +2022,6 @@ def index():
             <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
             <tbody id="nfpPairs"></tbody>
           </table>
-          <button class="btn" style="width:100%; margin-top:0.25rem;" onclick="publishSignal('NFP')">📡 Publish Official Desk Forecast to Clients</button>
-          <p id="nfpPubStatus" style="font-size:0.8rem; margin-top:0.5rem; color:var(--gold);"></p>
         </div>
 
         <div class="card">
@@ -1583,8 +2103,6 @@ def index():
             <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
             <tbody id="cpiPairs"></tbody>
           </table>
-          <button class="btn" style="width:100%; margin-top:0.25rem;" onclick="publishSignal('CPI')">📡 Publish Official Desk Forecast to Clients</button>
-          <p id="cpiPubStatus" style="font-size:0.8rem; margin-top:0.5rem; color:var(--gold);"></p>
         </div>
 
         <div class="card">
@@ -1669,8 +2187,6 @@ def index():
             <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
             <tbody id="ppiPairs"></tbody>
           </table>
-          <button class="btn" style="width:100%; margin-top:0.25rem;" onclick="publishSignal('PPI')">📡 Publish Official Desk Forecast to Clients</button>
-          <p id="ppiPubStatus" style="font-size:0.8rem; margin-top:0.5rem; color:var(--gold);"></p>
         </div>
 
         <div class="card">
@@ -1754,8 +2270,6 @@ def index():
             <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
             <tbody id="fomcPairs"></tbody>
           </table>
-          <button class="btn" style="width:100%; margin-top:0.25rem;" onclick="publishSignal('FOMC')">📡 Publish Official Desk Forecast to Clients</button>
-          <p id="fomcPubStatus" style="font-size:0.8rem; margin-top:0.5rem; color:var(--gold);"></p>
         </div>
 
         <div class="card">
@@ -1795,6 +2309,13 @@ def index():
           <div id="fomcDecodeOut" class="decoder-box hidden"></div>
         </div>
       </div>
+    </div>
+
+    <div id="newViews"></div>
+
+    <div id="clientQueue" class="client-only">
+      <h2 style="margin-bottom:0.75rem;"><span>⏳ Next Scheduled Release</span></h2>
+      <div id="clientQueueBody"><div class="card"><p style="color:var(--muted);">Loading the next event...</p></div></div>
     </div>
   </div>
 </div>
@@ -1928,6 +2449,7 @@ def index():
     if (currentUser.is_admin) {
       document.getElementById("adminBtn").classList.remove("hidden");
       document.getElementById("previewBtn").classList.remove("hidden");
+      setupV2Desk();
       setMode("desk");
       calcNFP();
       calcCPI();
@@ -1962,15 +2484,6 @@ def index():
 
   let ppiLoaded = false;
   let fomcLoaded = false;
-
-  function switchTab(tab) {
-    ["NFP", "CPI", "PPI", "FOMC"].forEach(t => {
-      document.getElementById("tab" + t).classList.toggle("active", t === tab);
-      document.getElementById("view" + t).classList.toggle("hidden", t !== tab);
-    });
-    if (tab === "PPI" && !ppiLoaded && viewMode === "desk") { ppiLoaded = true; calcPPI(); }
-    if (tab === "FOMC" && !fomcLoaded && viewMode === "desk") { fomcLoaded = true; calcFOMC(); }
-  }
 
   async function autoFetch() {
     const btn = document.getElementById("autoFetchBtn");
@@ -2219,14 +2732,6 @@ def index():
   };
   const MODULE_API = { NFP: "/api/predict-nfp", CPI: "/api/predict-cpi", PPI: "/api/predict-ppi", FOMC: "/api/predict-fomc" };
 
-  function setMode(mode) {
-    viewMode = mode;
-    document.body.classList.toggle("client-mode", mode === "client");
-    const btn = document.getElementById("previewBtn");
-    if (btn) btn.innerText = mode === "client" ? "🛠️ Back to Desk Mode" : "👁️ Preview Client View";
-    if (mode === "client") loadSignals();
-  }
-
   function togglePreview() {
     setMode(viewMode === "client" ? "desk" : "client");
   }
@@ -2351,6 +2856,470 @@ def index():
     } catch (e) {
       status.innerText = "Publish failed. Check your connection and try again.";
     }
+  }
+
+
+  // ==========================================================================
+  // V2: GBP + EUR modules, release scheduling, admin queue, next-event client view
+  // ==========================================================================
+  const FLAG = { USD: "🇺🇸", GBP: "🇬🇧", EUR: "🇪🇺" };
+  const FILTER_LABEL = { ALL: "All", USD: "🇺🇸 USD", GBP: "🇬🇧 GBP", EUR: "🇪🇺 EUR" };
+
+  // prefix = element-id prefix, api = predictor endpoint
+  const MODS = {
+    USD_NFP:  { cur: "USD", prefix: "nfp",  api: "/api/predict-nfp",  title: "NFP — US Non-Farm Payrolls" },
+    USD_CPI:  { cur: "USD", prefix: "cpi",  api: "/api/predict-cpi",  title: "CPI — US Consumer Prices" },
+    USD_PPI:  { cur: "USD", prefix: "ppi",  api: "/api/predict-ppi",  title: "PPI — US Producer Prices" },
+    USD_FOMC: { cur: "USD", prefix: "fomc", api: "/api/predict-fomc", title: "FOMC — Rate Decision & Chair Presser" },
+    GBP_CPI: {
+      cur: "GBP", prefix: "gbpcpi", api: "/api/predict-gbp-cpi", title: "UK CPI — BoE Services Focus",
+      heading: "UK CPI V2 Leading Proxies", tabLabel: "🇬🇧 UK CPI V2",
+      fields: [
+        ["uk_cpi_consensus", "UK CPI YoY Consensus (%) [Reference]", 2.4, 0.1],
+        ["uk_srv_pmi_prices", "UK Services PMI Prices Charged [30%]", 57.5, 0.1],
+        ["uk_srv_pmi_prices_prev", "UK Services PMI Prices Prev", 56.0, 0.1],
+        ["brc_shop_price_yoy", "BRC Shop Price Index YoY (%) [25%]", 1.8, 0.1],
+        ["brc_shop_price_prev", "BRC Shop Price Index Prev (%)", 1.5, 0.1],
+        ["uk_input_ppi_mom", "UK Input PPI MoM (%) [20%]", 0.3, 0.1],
+        ["kantar_grocery_yoy", "Kantar Grocery Inflation YoY (%) [10%]", 2.6, 0.1],
+        ["kantar_grocery_prev", "Kantar Grocery Inflation Prev (%)", 2.3, 0.1],
+        ["uk_gas_petrol_pct", "UK Gas / Petrol Monthly % Δ [8%]", 3.5, 0.1],
+        ["rec_starting_salaries", "REC Starting Salaries Index [7%]", 53.0, 0.1]
+      ],
+      checks: [["is_ofgem_reset_month", "Ofgem Energy-Cap Reset Month? April / October (Widens No-Trade Gate to ±35)"]],
+      labels: { up: "HOTTER UK CPI (GBP BULLISH)", down: "COOLER UK CPI (GBP BEARISH)", flat: "NO-TRADE / LOW EDGE" }
+    },
+    GBP_JOBS: {
+      cur: "GBP", prefix: "gbpjobs", api: "/api/predict-gbp-jobs", title: "UK Jobs & Wages — BoE Wage-First",
+      heading: "UK Jobs V2 Leading Proxies", tabLabel: "🇬🇧 UK Jobs V2",
+      fields: [
+        ["boe_dmp_wage_exp", "BoE DMP Wage Expectations (%) [20%]", 4.2, 0.1],
+        ["rec_starting_salaries", "REC Starting Salaries Index [15%]", 53.5, 0.1],
+        ["rec_starting_salaries_prev", "REC Starting Salaries Prev", 52.0, 0.1],
+        ["rec_placements_idx", "REC Permanent Placements Index [25%]", 48.5, 0.1],
+        ["rec_placements_prev", "REC Permanent Placements Prev", 47.0, 0.1],
+        ["uk_pmi_emp", "UK PMI Employment Index [20%]", 50.8, 0.1],
+        ["uk_pmi_emp_prev", "UK PMI Employment Prev", 49.9, 0.1],
+        ["hmrc_paye_change_k", "HMRC PAYE Payrolls Change (K) [12%]", 15.0, 1],
+        ["adzuna_job_ads_pct", "Adzuna Job Ads % Δ [8%]", 1.2, 0.1]
+      ],
+      checks: [],
+      note: "LFS divergence filter is automatic: if HMRC PAYE and REC placements point in opposite directions, the gate widens from ±25 to ±32.",
+      labels: { up: "HAWKISH WAGE-LED JOBS (GBP BULLISH)", down: "SOFT WAGE-LED JOBS (GBP BEARISH)", flat: "NO-TRADE / LOW EDGE" }
+    },
+    EUR_CPI: {
+      cur: "EUR", prefix: "eurcpi", api: "/api/predict-eur-cpi", title: "Eurozone / German Flash CPI",
+      heading: "Eurozone Flash CPI V2 Leading Proxies", tabLabel: "🇪🇺 EUR Flash CPI V2",
+      fields: [
+        ["eur_cpi_consensus", "Eurozone Flash CPI YoY Consensus (%) [Reference]", 2.1, 0.1],
+        ["german_states_weighted_cpi", "German States Weighted CPI (NRW+BY+HE) [45%]", 2.3, 0.1],
+        ["spain_france_flash_surprise", "Spain / France Flash Surprise (%) [25%]", 0.1, 0.1],
+        ["ttf_gas_brent_pct", "TTF Gas / Brent Monthly % Δ [15%]", 4.0, 0.1],
+        ["hcob_srv_pmi_prices", "HCOB Services PMI Prices [10%]", 55.2, 0.1],
+        ["hcob_srv_pmi_prices_prev", "HCOB Services PMI Prices Prev", 54.0, 0.1],
+        ["german_import_ppi_mom", "German Import PPI MoM (%) [5%]", 0.2, 0.1]
+      ],
+      checks: [["is_eu_summer_travel", "July–August Package-Holiday / Transport Window? (Widens No-Trade Gate to ±33)"]],
+      labels: { up: "HOTTER EZ CPI (EUR BULLISH)", down: "COOLER EZ CPI (EUR BEARISH)", flat: "NO-TRADE / LOW EDGE" }
+    },
+    EUR_PMI: {
+      cur: "EUR", prefix: "eurpmi", api: "/api/predict-eur-pmi", title: "Eurozone Flash PMI",
+      heading: "Eurozone Flash PMI V2 Leading Proxies", tabLabel: "🇪🇺 EUR Flash PMI V2",
+      fields: [
+        ["eur_comp_pmi_consensus", "Eurozone Composite PMI Consensus [Reference]", 50.5, 0.1],
+        ["german_flash_pmi", "German Flash PMI [40%]", 51.4, 0.1],
+        ["french_flash_pmi", "French Flash PMI [25%]", 50.8, 0.1],
+        ["zew_sentix_change", "ZEW / Sentix Change [20%]", 3.5, 0.1],
+        ["eur_new_orders_subidx", "Eurozone New Orders Sub-Index [15%]", 51.0, 0.1]
+      ],
+      checks: [],
+      note: "Franco-German divergence gate is automatic: if the two PMIs are 2.5+ points apart and on opposite sides of 50, the gate widens from ±25 to ±36.",
+      labels: { up: "STRONGER EZ PMI (EUR BULLISH)", down: "WEAKER EZ PMI (EUR BEARISH)", flat: "NO-TRADE / LOW EDGE" }
+    }
+  };
+  MODS.USD_NFP.labels  = MODULE_LABELS.NFP;
+  MODS.USD_CPI.labels  = MODULE_LABELS.CPI;
+  MODS.USD_PPI.labels  = MODULE_LABELS.PPI;
+  MODS.USD_FOMC.labels = MODULE_LABELS.FOMC;
+  const USD_PAYLOAD = { USD_NFP: nfpPayload, USD_CPI: cpiPayload, USD_PPI: ppiPayload, USD_FOMC: fomcPayload };
+  const TAB_ORDER = ["USD_NFP", "USD_CPI", "USD_PPI", "USD_FOMC", "GBP_CPI", "GBP_JOBS", "EUR_CPI", "EUR_PMI"];
+  const MOD_NAME = { USD_NFP: "NFP", USD_CPI: "CPI", USD_PPI: "PPI", USD_FOMC: "FOMC" };
+  const TAB_ID = { USD_NFP: "NFP", USD_CPI: "CPI", USD_PPI: "PPI", USD_FOMC: "FOMC" };
+  const tabIdFor = key => TAB_ID[key] || key.replace("_", "");
+
+  // ---- post-release decoder definitions (shared by the desk tabs and the client cards) ----
+  const SEL_RATE = [["MORE_HAWKISH", "More hawkish than priced"], ["INLINE", "In line with pricing"], ["MORE_DOVISH", "More dovish than priced"]];
+  const SEL_DOTS = [["HAWKISH_SHIFT", "Hawkish shift"], ["UNCHANGED", "Unchanged"], ["DOVISH_SHIFT", "Dovish shift"]];
+  const SEL_VOTE = [["UNANIMOUS", "Unanimous"], ["HAWKISH_DISSENT", "Hawkish dissent"], ["DOVISH_DISSENT", "Dovish dissent"]];
+  const SEL_CHAIR = [["PENDING", "Pending (presser not started)"], ["PUSHBACK_ON_CUTS", "Pushback on cuts"], ["DATA_DEPENDENT", "Data dependent"], ["OPEN_TO_EASING", "Open to easing"]];
+  const DEC = {
+    USD_NFP: { url: "/api/decode-nfp", fields: [
+      ["consensus_nfp", "NFP Consensus (K)", 110, 1, "consensus_nfp"], ["actual_nfp", "Actual NFP Print (K)", 165, 1],
+      ["revisions_k", "2-Month Net Revisions (K)", 20, 1], ["unemp_forecast", "Unemployment Forecast (%)", 4.1, 0.1],
+      ["unemp_actual", "Unemployment Actual (%)", 4.0, 0.1], ["ahe_forecast", "Avg Hourly Earnings Forecast (%)", 0.3, 0.1],
+      ["ahe_actual", "Avg Hourly Earnings Actual (%)", 0.4, 0.1]] },
+    USD_CPI: { url: "/api/decode-cpi", fields: [
+      ["headline_forecast", "Headline CPI MoM Forecast (%)", 0.3, 0.1, "cpi_mom_consensus"], ["headline_actual", "Headline CPI MoM Actual (%)", 0.4, 0.1],
+      ["core_forecast", "Core CPI MoM Forecast (%)", 0.3, 0.1], ["core_actual", "Core CPI MoM Actual (%)", 0.4, 0.1]] },
+    USD_PPI: { url: "/api/decode-ppi", fields: [
+      ["headline_forecast", "Headline PPI MoM Forecast (%)", 0.3, 0.1, "ppi_mom_consensus"], ["headline_actual", "Headline PPI MoM Actual (%)", 0.5, 0.1],
+      ["core_forecast", "Core PPI MoM Forecast (%)", 0.3, 0.1], ["core_actual", "Core PPI MoM Actual (%)", 0.2, 0.1]] },
+    USD_FOMC: { url: "/api/decode-fomc", fields: [], selects: [
+      ["rate_surprise", "Rate Decision vs Pricing", SEL_RATE, "INLINE"], ["dot_plot_tone", "Dot Plot / Statement Tone", SEL_DOTS, "UNCHANGED"],
+      ["vote_split", "Vote Split", SEL_VOTE, "UNANIMOUS"], ["chair_presser_cue", "Chair Presser Cue (2:30 PM ET)", SEL_CHAIR, "PENDING"]] },
+    GBP_CPI: { url: "/api/decode-gbp", extra: { event_type: "UK_CPI" }, fields: [
+      ["headline_forecast", "Headline CPI YoY Forecast (%)", 2.4, 0.1, "uk_cpi_consensus"], ["headline_actual", "Headline CPI YoY Actual (%)", 2.3, 0.1],
+      ["core_or_wages_forecast", "Services CPI YoY Forecast (%)", 4.8, 0.1], ["core_or_wages_actual", "Services CPI YoY Actual (%)", 5.0, 0.1]] },
+    GBP_JOBS: { url: "/api/decode-gbp", extra: { event_type: "UK_JOBS" }, fields: [
+      ["headline_forecast", "Unemployment Rate (3M) Forecast (%)", 4.4, 0.1], ["headline_actual", "Unemployment Rate (3M) Actual (%)", 4.5, 0.1],
+      ["core_or_wages_forecast", "Avg Weekly Earnings 3M YoY Forecast (%)", 4.6, 0.1], ["core_or_wages_actual", "Avg Weekly Earnings 3M YoY Actual (%)", 4.8, 0.1]] },
+    EUR_CPI: { url: "/api/decode-eur", extra: { event_type: "EUR_CPI" }, fields: [
+      ["headline_forecast", "Flash CPI YoY Forecast (%)", 2.1, 0.1, "eur_cpi_consensus"], ["headline_actual", "Flash CPI YoY Actual (%)", 2.0, 0.1],
+      ["core_or_services_forecast", "Core CPI YoY Forecast (%)", 2.3, 0.1], ["core_or_services_actual", "Core CPI YoY Actual (%)", 2.5, 0.1]] },
+    EUR_PMI: { url: "/api/decode-eur", extra: { event_type: "EUR_PMI" }, fields: [
+      ["headline_forecast", "Composite Flash PMI Forecast", 50.5, 0.1, "eur_comp_pmi_consensus"], ["headline_actual", "Composite Flash PMI Actual", 50.1, 0.1],
+      ["core_or_services_forecast", "Services Flash PMI Forecast", 51.0, 0.1], ["core_or_services_actual", "Services Flash PMI Actual", 51.8, 0.1]] }
+  };
+
+  function decoderFormHtml(key, idp, inputs) {
+    const cfg = DEC[key];
+    const inp = inputs || {};
+    const nums = cfg.fields.map(f => {
+      const v = (f[4] && inp[f[4]] !== undefined) ? inp[f[4]] : f[2];
+      return `<div><label>${esc(f[1])}</label><input type="number" id="${idp}_${f[0]}" value="${esc(v)}" step="${f[3]}" /></div>`;
+    }).join("");
+    const sels = (cfg.selects || []).map(s =>
+      `<div><label>${esc(s[1])}</label><select id="${idp}_${s[0]}">${s[2].map(o => `<option value="${o[0]}"${o[0] === s[3] ? " selected" : ""}>${esc(o[1])}</option>`).join("")}</select></div>`
+    ).join("");
+    return `<div class="form-grid">${nums}${sels}</div>
+      <button class="btn-outline" style="width:100%; margin-top:0.85rem;" onclick="runDecoder('${key}', '${idp}')">Decode Actual Print &amp; Get Trade Plan</button>
+      <div id="${idp}_out" class="decoder-box hidden"></div>`;
+  }
+
+  async function runDecoder(key, idp) {
+    const cfg = DEC[key];
+    const payload = { ...(cfg.extra || {}) };
+    cfg.fields.forEach(f => { payload[f[0]] = Number(document.getElementById(`${idp}_${f[0]}`).value); });
+    (cfg.selects || []).forEach(s => { payload[s[0]] = document.getElementById(`${idp}_${s[0]}`).value; });
+    const { ok, data } = await apiPost(cfg.url, payload);
+    showDecode(`${idp}_out`, ok ? data : { verdict: "Could not decode", plan: errText(data) });
+  }
+
+  // ---- desk views for the four new modules (built from the definitions above) ----
+  function buildDeskView(key) {
+    const m = MODS[key];
+    const p = m.prefix;
+    const fields = m.fields.map(f =>
+      `<div><label>${esc(f[1])}</label><input type="number" id="${p}_${f[0]}" value="${f[2]}" step="${f[3]}" /></div>`).join("");
+    const checks = m.checks.map(c =>
+      `<div class="check-row"><input type="checkbox" id="${p}_${c[0]}" /><label for="${p}_${c[0]}" style="margin:0; color:var(--text); cursor:pointer;">${esc(c[1])}</label></div>`).join("");
+    const note = m.note ? `<p style="font-size:0.8rem; color:var(--muted); margin-top:0.75rem;">${esc(m.note)}</p>` : "";
+    return `<div id="view${tabIdFor(key)}" class="grid hidden">
+      <div class="card desk-only">
+        <h2><span>1. ${esc(m.heading)}</span> <span style="font-size:0.75rem; color:var(--muted);">${FLAG[m.cur]} ${m.cur} V2</span></h2>
+        <div class="form-grid">${fields}${checks}</div>${note}
+        <button class="btn" style="width:100%; margin-top:1rem;" onclick="calcGeneric('${key}')">Calculate ${esc(m.heading.replace(' Leading Proxies', ''))} Outcome &amp; FX Spikes</button>
+      </div>
+      <div>
+        <div class="card desk-only" id="${p}DeskCard">
+          <h2><span>2. ${esc(m.title)} — FX Spike Matrix</span> <span id="${p}Tier" style="font-size:0.75rem; color:var(--gold);"></span></h2>
+          <div class="verdict-box">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
+              <span id="${p}Bias" class="big-score neut">READY</span>
+              <span id="${p}Score" style="font-weight:700;"></span>
+            </div>
+            <p id="${p}Summary" style="font-size:0.88rem; color:#d1d5db;"></p>
+          </div>
+          <table>
+            <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
+            <tbody id="${p}Pairs"></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h2>⚡ 3. Post-Release Action Decoder</h2>
+          ${decoderFormHtml(key, "dec_" + p, null)}
+        </div>
+      </div>
+    </div>`;
+  }
+
+  function genericPayload(key) {
+    const m = MODS[key];
+    const out = {};
+    m.fields.forEach(f => { out[f[0]] = Number(document.getElementById(`${m.prefix}_${f[0]}`).value); });
+    m.checks.forEach(c => { out[c[0]] = document.getElementById(`${m.prefix}_${c[0]}`).checked; });
+    return out;
+  }
+
+  function renderGeneric(key, d) {
+    const m = MODS[key];
+    const p = m.prefix;
+    const up = d.bias === "HOTTER", down = d.bias === "COOLER";
+    const el = document.getElementById(p + "Bias");
+    el.innerText = up ? m.labels.up : down ? m.labels.down : m.labels.flat;
+    el.className = "big-score " + (up ? "bull" : down ? "bear" : "neut");
+    document.getElementById(p + "Tier").innerText = d.tier || "";
+    document.getElementById(p + "Score").innerText = `Score: ${d.score > 0 ? "+" : ""}${d.score} | Gate: ±${d.buffer} | Conf: ${d.confidence}%`;
+    document.getElementById(p + "Summary").innerText = d.summary;
+    document.getElementById(p + "Pairs").innerHTML = pairRows(d.pairs);
+  }
+
+  async function calcGeneric(key) {
+    const m = MODS[key];
+    const { ok, data } = await apiPost(m.api, { user_email: currentUser ? currentUser.email : "", ...genericPayload(key) });
+    if (!ok) { document.getElementById(m.prefix + "Summary").innerText = errText(data); return; }
+    renderGeneric(key, data);
+  }
+
+  // ---- tabs + currency filter (admin) ----
+  const loadedTab = { USD_NFP: true, USD_CPI: true };
+  let curFilter = "ALL";
+
+  function switchTab(tab) {
+    TAB_ORDER.forEach(k => {
+      const id = tabIdFor(k);
+      const active = (k === tab) || (id === tab);
+      document.getElementById("tab" + id).classList.toggle("active", active);
+      document.getElementById("view" + id).classList.toggle("hidden", !active);
+      if (active && viewMode === "desk" && !loadedTab[k]) {
+        loadedTab[k] = true;
+        if (k === "USD_PPI") { ppiLoaded = true; calcPPI(); }
+        else if (k === "USD_FOMC") { fomcLoaded = true; calcFOMC(); }
+        else if (MODS[k].fields) { calcGeneric(k); }
+      }
+    });
+  }
+
+  function setCurFilter(cur) {
+    curFilter = cur;
+    document.querySelectorAll(".cur-chip").forEach(c => c.classList.toggle("active", c.dataset.cur === cur));
+    let first = null;
+    TAB_ORDER.forEach(k => {
+      const show = cur === "ALL" || MODS[k].cur === cur;
+      document.getElementById("tab" + tabIdFor(k)).classList.toggle("hidden", !show);
+      if (show && !first) first = k;
+    });
+    const activeNow = TAB_ORDER.find(k => document.getElementById("tab" + tabIdFor(k)).classList.contains("active"));
+    if (!activeNow || !(cur === "ALL" || MODS[activeNow].cur === cur)) switchTab(first);
+  }
+
+  // ---- scheduling + publishing (admin) ----
+  function schedulePanelHtml(key) {
+    const m = MODS[key];
+    return `<div class="card desk-only sched-box" id="sched_${key}">
+      <h2><span>📅 Schedule &amp; Publish — ${FLAG[m.cur]} ${esc(m.title)}</span></h2>
+      <label>Release Date &amp; Time (your local time — saved as UTC)</label>
+      <input type="datetime-local" id="rel_${key}" style="margin-bottom:0.85rem;" />
+      <button class="btn btn-publish" onclick="publishEvent('${key}')">📡 Publish to Next-Event Client Queue</button>
+      <button class="btn-outline" style="width:100%; margin-top:0.6rem;" onclick="togglePreview()">👁️ Preview Client View</button>
+      <p id="pubst_${key}" style="font-size:0.8rem; margin-top:0.5rem; color:var(--gold);"></p>
+    </div>`;
+  }
+
+  function payloadForKey(key) {
+    return USD_PAYLOAD[key] ? USD_PAYLOAD[key]() : genericPayload(key);
+  }
+
+  async function publishEvent(key) {
+    const m = MODS[key];
+    const status = document.getElementById("pubst_" + key);
+    const local = document.getElementById("rel_" + key).value;
+    if (!local) { status.innerText = "Pick a release date & time first."; return; }
+    const when = new Date(local);
+    if (isNaN(when.getTime())) { status.innerText = "That release date & time is not valid."; return; }
+    const releaseUtc = when.toISOString().slice(0, 19) + "Z";
+    if (!confirm(`Publish ${m.title} to clients for ${when.toLocaleString()}? It replaces any queued ${key} event.`)) return;
+    status.innerText = "Calculating and publishing...";
+    try {
+      const inputs = payloadForKey(key);
+      const calc = await apiPost(m.api, { user_email: currentUser.email, ...inputs });
+      if (!calc.ok) { status.innerText = "Could not calculate: " + errText(calc.data); return; }
+      if (key === "USD_NFP") renderForecast("nfp", calc.data, true);
+      else if (key === "USD_CPI") renderForecast("cpi", calc.data, false);
+      else if (key === "USD_PPI") renderPPI(calc.data);
+      else if (key === "USD_FOMC") renderFOMC(calc.data);
+      else renderGeneric(key, calc.data);
+      const pub = await apiPost("/api/admin/publish-event", {
+        event_id: key, currency: m.cur, title: m.title, release_utc: releaseUtc,
+        inputs: inputs, result: calc.data, active: true
+      });
+      if (!pub.ok) { status.innerText = "Publish failed: " + errText(pub.data); return; }
+      const warn = pub.data.storage && !pub.data.storage.includes("Permanent") ? " WARNING: saved only to temporary storage (" + pub.data.storage + ")." : "";
+      status.innerText = `✅ Queued for ${when.toLocaleString()}.${warn}`;
+      loadQueue();
+    } catch (e) {
+      status.innerText = "Publish failed. Check your connection and try again.";
+    }
+  }
+
+  // ---- admin queue manager ----
+  function eventState(ev, nowMs) {
+    const rel = Date.parse(ev.release_utc);
+    if (!ev.active) return { cls: "done", label: "INACTIVE" };
+    if (nowMs < rel) return { cls: "up", label: "UPCOMING" };
+    if (nowMs <= rel + 2 * 3600 * 1000) return { cls: "live", label: "LIVE WINDOW" };
+    return { cls: "done", label: "EXPIRED" };
+  }
+
+  async function loadQueue() {
+    const body = document.getElementById("queueBody");
+    if (!body) return;
+    try {
+      const res = await fetch("/api/next-events?all=1", { cache: "no-store" });
+      if (!res.ok) throw new Error("bad response");
+      const data = await res.json();
+      serverOffset = Date.parse(data.server_time) - Date.now();
+      const now = Date.now() + serverOffset;
+      if (!data.events.length) {
+        body.innerHTML = `<tr><td colspan="5" style="color:var(--muted);">Nothing queued. Clients will see "no upcoming event" until you publish one.</td></tr>`;
+        return;
+      }
+      body.innerHTML = data.events.map(ev => {
+        const st = eventState(ev, now);
+        return `<tr><td><strong>${esc(FLAG[ev.currency] || "")} ${esc(ev.title)}</strong><br><span style="color:var(--muted); font-size:0.75rem;">${esc(ev.event_id)}</span></td>
+          <td>${esc(fmtTime(ev.release_utc))}</td><td>${esc(ev.release_utc)}</td>
+          <td><span class="pill ${st.cls}">${st.label}</span></td>
+          <td><button class="btn-outline" onclick="removeEvent('${esc(ev.event_id)}')">Remove</button></td></tr>`;
+      }).join("");
+    } catch (e) {
+      body.innerHTML = `<tr><td colspan="5" style="color:var(--red);">Could not load the queue. Tap Refresh to try again.</td></tr>`;
+    }
+  }
+
+  async function removeEvent(id) {
+    if (!confirm(`Remove ${id} from the client queue?`)) return;
+    try {
+      const res = await fetch("/api/admin/publish-event/" + encodeURIComponent(id), { method: "DELETE" });
+      if (!res.ok) { const d = await res.json().catch(() => ({})); alert(errText(d)); return; }
+    } catch (e) { alert("Could not remove the event. Check your connection."); return; }
+    loadQueue();
+  }
+
+  // ---- client view: next upcoming event(s) only ----
+  let serverOffset = 0;
+  let lastQueueSig = "";
+  let clientTimer = null;
+  let tickTimer = null;
+  let refetching = false;
+  let lastRefetch = 0;
+
+  function fmtCountdown(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    const p = n => String(n).padStart(2, "0");
+    return `${p(Math.floor(s / 86400))}d ${p(Math.floor((s % 86400) / 3600))}h ${p(Math.floor((s % 3600) / 60))}m ${p(s % 60)}s`;
+  }
+
+  function tickCountdowns() {
+    const now = Date.now() + serverOffset;
+    document.querySelectorAll(".countdown").forEach(el => {
+      const rel = Date.parse(el.dataset.release);
+      if (isNaN(rel)) return;
+      if (now < rel) {
+        el.innerText = "⏳ Releases in: " + fmtCountdown(rel - now);
+        el.classList.remove("live");
+      } else if (now <= rel + 2 * 3600 * 1000) {
+        el.innerText = "🔴 LIVE RELEASE WINDOW — USE DECODER BELOW";
+        el.classList.add("live");
+      } else if (!refetching && Date.now() - lastRefetch > 15000) {
+        refetching = true;
+        lastRefetch = Date.now();
+        loadClientQueue(true).finally(() => { refetching = false; });
+      }
+    });
+  }
+
+  function metricFor(key, d) {
+    const sign = d.score > 0 ? "+" : "";
+    if (key === "USD_NFP") return `Edge: ${sign}${d.score}K`;
+    if (key === "USD_FOMC") return `Hawkish score: ${sign}${d.score} | Gate: ±${d.gate} | Reversal risk: ${d.reversal_risk}`;
+    if (d.buffer !== undefined) return `Score: ${sign}${d.score} | Gate: ±${d.buffer}`;
+    return `Score: ${sign}${d.score}`;
+  }
+
+  function eventCardHtml(ev) {
+    const key = `${ev.currency}_${ev.module}`;
+    const m = MODS[key];
+    const d = ev.result || {};
+    const L = m ? m.labels : { up: "BULLISH", down: "BEARISH", flat: "NO-TRADE / LOW EDGE" };
+    const up = d.bias === "HOTTER" || d.bias === "HAWKISH";
+    const down = d.bias === "COOLER" || d.bias === "DOVISH";
+    const tier = d.tier || (d.crowded ? "CROWDED CONSENSUS (BUY RUMOR / SELL FACT RISK)" : "");
+    const idp = "cdec_" + ev.event_id;
+    const decoder = DEC[key] ? `<div class="card" style="margin-top:1.1rem; margin-bottom:0;">
+        <h2>⚡ Post-Release Action Decoder</h2>${decoderFormHtml(key, idp, ev.inputs)}</div>` : "";
+    return `<div class="card" style="border-color:var(--gold);">
+      <div class="countdown" data-release="${esc(ev.release_utc)}">⏳ Releases in: --d --h --m --s</div>
+      <div class="desk-badge" style="margin-bottom:0.9rem;">🏛️ A&amp;M Group Research Desk — Official Signal (Updated: ${esc(fmtTime(ev.updated_at))})</div>
+      <h2><span>${esc(FLAG[ev.currency] || "")} ${esc(ev.title)} — Asset &amp; FX Spike Matrix</span> <span style="font-size:0.75rem; color:var(--gold);">${esc(tier)}</span></h2>
+      <div class="verdict-box">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.4rem; margin-bottom:0.4rem;">
+          <span class="big-score ${up ? "bull" : down ? "bear" : "neut"}">${esc(up ? L.up : down ? L.down : L.flat)}</span>
+          <span style="font-weight:700;">${esc(metricFor(key, d))}</span>
+        </div>
+        <p style="font-size:0.88rem; color:#d1d5db;">${esc(d.summary || "")}</p>
+      </div>
+      <div style="overflow-x:auto;"><table>
+        <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
+        <tbody>${Array.isArray(d.pairs) ? pairRows(d.pairs) : ""}</tbody>
+      </table></div>
+      ${decoder}
+    </div>`;
+  }
+
+  async function loadClientQueue(force) {
+    const box = document.getElementById("clientQueueBody");
+    try {
+      const res = await fetch("/api/next-events", { cache: "no-store" });
+      if (!res.ok) throw new Error("bad response");
+      const data = await res.json();
+      serverOffset = Date.parse(data.server_time) - Date.now();
+      const sig = (data.events || []).map(e => e.event_id + "|" + e.updated_at + "|" + e.release_utc).join(",");
+      if (!force && sig === lastQueueSig) { tickCountdowns(); return; }
+      lastQueueSig = sig;
+      if (!data.events.length) {
+        box.innerHTML = `<div class="card"><h2>No upcoming event scheduled</h2><p style="color:var(--muted); font-size:0.9rem;">The research desk has not scheduled the next release yet. This page checks again every minute.</p></div>`;
+      } else {
+        box.innerHTML = data.events.map(eventCardHtml).join("");
+      }
+      tickCountdowns();
+    } catch (e) {
+      lastQueueSig = "";
+      box.innerHTML = `<div class="card"><h2>Could not load the next event</h2><p style="color:var(--muted); font-size:0.9rem; margin-bottom:0.75rem;">Check your connection and try again.</p><button class="btn-outline" onclick="loadClientQueue(true)">🔄 Retry</button></div>`;
+    }
+  }
+
+  function setMode(mode) {
+    viewMode = mode;
+    document.body.classList.toggle("client-mode", mode === "client");
+    const btn = document.getElementById("previewBtn");
+    if (btn) btn.innerText = mode === "client" ? "🛠️ Back to Desk Mode" : "👁️ Preview Client View";
+    clearInterval(clientTimer); clearInterval(tickTimer);
+    if (mode === "client") {
+      lastQueueSig = "";
+      loadClientQueue(true);
+      tickTimer = setInterval(tickCountdowns, 1000);
+      clientTimer = setInterval(() => loadClientQueue(false), 60000);
+    } else if (currentUser && currentUser.is_admin) {
+      loadQueue();
+    }
+  }
+
+  // ---- one-time admin setup: new tabs, desk views, schedule panels, queue manager ----
+  let v2Ready = false;
+  function setupV2Desk() {
+    if (v2Ready) return;
+    v2Ready = true;
+    const tabsBox = document.getElementById("tabsBox");
+    ["GBP_CPI", "GBP_JOBS", "EUR_CPI", "EUR_PMI"].forEach(k => {
+      tabsBox.insertAdjacentHTML("beforeend", `<button class="tab" id="tab${tabIdFor(k)}" onclick="switchTab('${k}')">${MODS[k].tabLabel}</button>`);
+      document.getElementById("newViews").insertAdjacentHTML("beforeend", buildDeskView(k));
+    });
+    TAB_ORDER.forEach(k => {
+      const host = document.getElementById(MODS[k].prefix + "DeskCard");
+      if (host) host.insertAdjacentHTML("afterend", schedulePanelHtml(k));
+    });
+    document.getElementById("curFilter").innerHTML = ["ALL", "USD", "GBP", "EUR"].map(c =>
+      `<button class="cur-chip${c === "ALL" ? " active" : ""}" data-cur="${c}" onclick="setCurFilter('${c}')">${FILTER_LABEL[c]}</button>`).join("");
   }
 
   if (currentUser) {
