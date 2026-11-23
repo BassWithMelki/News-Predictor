@@ -3403,6 +3403,114 @@ def index():
     }
   }
 
+  // ---- Admin cheat sheet: release & data-entry schedule (EAT). Built only for the admin; never rendered for clients ----
+  const SHEET_LINKS = {
+    FF: ["Forex Factory", "https://www.forexfactory.com/calendar"],
+    CLEV: ["Cleveland Fed", "https://www.clevelandfed.org/indicators-and-data/inflation-nowcasting"],
+    ISM: ["ISM", "https://www.ismworld.org/supply-management-news-and-reports/reports/ism-report-on-business/"],
+    NFIB: ["NFIB", "https://www.nfib.com/surveys/small-business-economic-trends/"],
+    HB: ["Homebase", "https://joinhomebase.com/data/"],
+    CME: ["CME FedWatch", "https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html"],
+    ONS: ["ONS", "https://www.ons.gov.uk/releasecalendar"],
+    BRC: ["BRC", "https://brc.org.uk/"],
+    REC: ["REC", "https://www.rec.uk.com/"],
+    PMI: ["S&P Global PMI", "https://www.pmi.spglobal.com/"]
+  };
+  const SHEET = [
+    { key: "USD_NFP", cur: "USD", main: "First Friday of the month, 16:30 EAT", rows: [
+      ["ISM Services Employment [22%]", "3rd business day, 18:00", "ISM"],
+      ["Initial Claims 12th-week Δ [16%]", "Every Thursday, 16:30", "FF"],
+      ["Continuing Claims 12th-week Δ [12%]", "Every Thursday, 16:30", "FF"],
+      ["ADP Employment [14%]", "Wednesday before NFP, 16:15", "FF"],
+      ["Homebase Hours % Δ [12%]", "Live data page, check the day before NFP", "HB"],
+      ["Conf. Board Labor Differential [8%]", "Last Tuesday of the month, 18:00", "FF"],
+      ["ISM Manufacturing Employment [8%]", "1st business day, 18:00", "ISM"],
+      ["NFIB Hiring Plans [8%]", "2nd Tuesday of the month, 14:00", "NFIB"],
+      ["Prior-month Govt Education Swing", "From the previous NFP report", "FF"]
+    ] },
+    { key: "USD_CPI", cur: "USD", main: "Mid-month (~10th–15th), 16:30 EAT", rows: [
+      ["Cleveland Fed Nowcast MoM [25%]", "Updated daily", "CLEV"],
+      ["WTI Oil / Gas Monthly % Δ [18%]", "Daily, use ⚡ Auto-Fetch", null],
+      ["ISM Services Prices Paid [15%]", "3rd business day, 18:00", "ISM"],
+      ["ISM Manufacturing Prices Paid [12%]", "1st business day, 18:00", "ISM"],
+      ["Core PPI MoM Surprise [10%]", "PPI day (around CPI), 16:30", "FF"],
+      ["Manheim Used Cars % Δ [8%]", "Monthly, early and mid-month", "FF"],
+      ["Market Rent Index MoM [7%]", "Monthly, first week", null],
+      ["NFIB Small Biz Price Plans [5%]", "2nd Tuesday of the month, 14:00", "NFIB"]
+    ] },
+    { key: "USD_PPI", cur: "USD", main: "Around CPI week, 16:30 EAT", rows: [
+      ["ISM Services Prices Paid [22%]", "3rd business day, 18:00", "ISM"],
+      ["ISM Manufacturing Prices Paid [18%]", "1st business day, 18:00", "ISM"],
+      ["WTI Oil / Gas Monthly % Δ [18%]", "Daily, use ⚡ Auto-Fetch", null],
+      ["Regional Fed Prices Paid, Empire / Philly [14%]", "Empire ~15th, Philly 3rd Thursday, 16:30", "FF"],
+      ["Freight Rate % Δ [8%]", "Weekly", null],
+      ["Agri & Metals % Δ [8%]", "Daily market data", null],
+      ["NFIB Small Biz Price Plans [7%]", "2nd Tuesday of the month, 14:00", "NFIB"],
+      ["Import Price Surprise [5%]", "Around CPI week, 16:30", "FF"]
+    ] },
+    { key: "USD_FOMC", cur: "USD", main: "Decision 22:00 EAT, Chair presser 22:30 EAT", rows: [
+      ["US 2-Year Yield 5-day change [40%]", "Live market data", null],
+      ["Recent Core CPI Surprise [35%]", "CPI day, 16:30", "FF"],
+      ["Recent NFP Edge [25%]", "First Friday, 16:30", "FF"],
+      ["FedWatch probability of expected move (priced-in check)", "Live, check before the statement", "CME"]
+    ] },
+    { key: "GBP_CPI", cur: "GBP", main: "Wednesday, 10:00 EAT (ONS)", rows: [
+      ["UK Services PMI Prices Charged [30%]", "Flash ~3rd/4th week 12:30; final 3rd business day 12:30", "PMI"],
+      ["BRC Shop Price Index [25%]", "First Tuesday of the month, 03:01", "BRC"],
+      ["UK Input PPI MoM [20%]", "ONS PPI release, around CPI day", "ONS"],
+      ["Kantar Grocery Inflation [10%]", "Every ~4 weeks, Tuesday morning", null],
+      ["UK Gas / Petrol % Δ [8%]", "Daily, use ⚡ Auto-Fetch", null],
+      ["REC Starting Salaries [7%]", "~8th–10th of the month, 03:01", "REC"],
+      ["Ofgem cap reset (April / October) checkbox", "Check the Ofgem date", "ONS"]
+    ] },
+    { key: "GBP_JOBS", cur: "GBP", main: "Tuesday, 10:00 EAT (ONS Labour Market)", rows: [
+      ["BoE DMP Wage Expectations [20%]", "Early month (around the first Thursday)", "FF"],
+      ["REC Permanent Placements [25%]", "~8th–10th of the month, 03:01", "REC"],
+      ["UK PMI Employment [20%]", "Flash ~3rd/4th week 12:30; final 3rd business day 12:30", "PMI"],
+      ["REC Starting Salaries [15%]", "~8th–10th of the month, 03:01", "REC"],
+      ["HMRC PAYE Payrolls Change [12%]", "Released with ONS Labour Market, Tuesday 10:00", "ONS"],
+      ["Adzuna Job Ads % Δ [8%]", "Monthly, first week", null]
+    ] },
+    { key: "EUR_CPI", cur: "EUR", main: "Eurostat flash, around month-end, 13:00 EAT", rows: [
+      ["German States Weighted CPI (NRW, Bavaria, Hesse) [45%]", "Morning of the German flash CPI", "FF"],
+      ["Spain / France Flash Surprise [25%]", "Same morning: France 10:45, Spain 11:00", "FF"],
+      ["TTF Gas / Brent % Δ [15%]", "Daily, use ⚡ Auto-Fetch", null],
+      ["HCOB Services PMI Prices [10%]", "Flash ~3rd/4th week 12:00; final 3rd business day", "PMI"],
+      ["German Import PPI MoM [5%]", "Around the 20th, 10:00", "FF"]
+    ] },
+    { key: "EUR_PMI", cur: "EUR", main: "HCOB Flash, 12:00 EAT (Germany 11:30, France 11:15)", rows: [
+      ["German Flash PMI [40%]", "Flash day ~3rd/4th week, 11:30", "PMI"],
+      ["French Flash PMI [25%]", "Flash day, 11:15", "PMI"],
+      ["ZEW Economic Sentiment / Sentix change [20%]", "ZEW 2nd/3rd Tuesday 13:00; Sentix first Monday 12:30", "FF"],
+      ["Eurozone New Orders Sub-Index [15%]", "With the full HCOB release, 12:00", "PMI"]
+    ] }
+  ];
+
+  function sheetFilter(cur) {
+    document.querySelectorAll(".sheet-chip").forEach(c => c.classList.toggle("active", c.dataset.cur === cur));
+    document.querySelectorAll(".sh-row").forEach(r => r.classList.toggle("hidden", cur !== "ALL" && r.dataset.cur !== cur));
+  }
+
+  function sheetHtml() {
+    const link = k => k ? `<a href="${SHEET_LINKS[k][1]}" target="_blank" rel="noopener noreferrer" style="color:var(--gold-bright);">${esc(SHEET_LINKS[k][0])} ↗</a>` : `<span style="color:var(--muted);">—</span>`;
+    const body = SHEET.map(s => {
+      const head = `<tr class="sh-row" data-cur="${s.cur}"><td colspan="3" style="background:#04140f; color:var(--gold-bright); font-weight:800;">${FLAG[s.cur]} ${s.key} <span style="color:var(--muted); font-weight:600;">— ${esc(s.main)}</span></td></tr>`;
+      const rows = s.rows.map(r => `<tr class="sh-row" data-cur="${s.cur}"><td>${esc(r[0])}</td><td>${esc(r[1])}</td><td>${link(r[2])}</td></tr>`).join("");
+      return head + rows;
+    }).join("");
+    const chips = ["ALL", "USD", "GBP", "EUR"].map(c =>
+      `<button class="cur-chip sheet-chip${c === "ALL" ? " active" : ""}" data-cur="${c}" onclick="sheetFilter('${c}')">${FILTER_LABEL[c]}</button>`).join("");
+    return `<details class="card desk-only" id="sheetCard" style="border-color: var(--gold);">
+      <summary style="cursor:pointer; font-weight:800; color:var(--gold-bright);">📅 Master Red-Folder Release &amp; Data-Entry Schedule (EAT)</summary>
+      <div class="cur-filter" style="margin-top:0.9rem;">${chips}</div>
+      <div style="overflow-x:auto;"><table>
+        <thead><tr><th>Proxy Input [weight]</th><th>Release (EAT)</th><th>Link</th></tr></thead>
+        <tbody>${body}</tbody>
+      </table></div>
+      <p style="font-size:0.78rem; color:var(--muted); margin-top:0.75rem;">Typical timings, shown on winter clocks (US EST, UK GMT, EU CET). Subtract 1 hour while that region is on daylight time. Always confirm exact dates on Forex Factory.</p>
+    </details>`;
+  }
+
   // ---- one-time admin setup: new tabs, desk views, schedule panels, queue manager ----
   let v2Ready = false;
   function setupV2Desk() {
@@ -3417,6 +3525,7 @@ def index():
       const host = document.getElementById(MODS[k].prefix + "DeskCard");
       if (host) host.insertAdjacentHTML("afterend", schedulePanelHtml(k));
     });
+    document.getElementById("queueCard").insertAdjacentHTML("beforebegin", sheetHtml());
     document.getElementById("curFilter").innerHTML = ["ALL", "USD", "GBP", "EUR"].map(c =>
       `<button class="cur-chip${c === "ALL" ? " active" : ""}" data-cur="${c}" onclick="setCurFilter('${c}')">${FILTER_LABEL[c]}</button>`).join("");
   }
