@@ -10,6 +10,7 @@ import secrets
 import sqlite3
 import logging
 import threading
+from typing import Optional
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 import requests
@@ -1483,14 +1484,15 @@ def decode_gbp(d: DecodeGBPReq, user: str = Depends(current_user)):
 # ----- EUR -----
 class EUR_CPIInput(BaseModel):
     user_email: str
+    eur_cpi_mode: str = "YoY"                 # "YoY" or "MoM"
     eur_cpi_consensus: float = 2.1
-    german_states_weighted_cpi: float = 2.3
-    spain_france_flash_surprise: float = 0.1
-    ttf_gas_brent_pct: float = 4.0
-    hcob_srv_pmi_prices: float = 55.2
-    hcob_srv_pmi_prices_prev: float = 54.0
-    german_import_ppi_mom: float = 0.2
-    is_eu_summer_travel: bool = False
+    germany_hicp: float = 2.3
+    france_hicp: float = 2.1
+    italy_hicp: float = 1.9
+    spain_hicp: float = 2.5
+    netherlands_hicp: Optional[float] = None  # optional, leave blank if not released
+    belgium_hicp: Optional[float] = None      # optional, leave blank if not released
+    lead_indicator: str = "NEUTRAL"           # BULLISH (+0.05) / NEUTRAL (0) / BEARISH (-0.05)
 
 class EUR_PMIInput(BaseModel):
     user_email: str
@@ -1507,29 +1509,86 @@ class DecodeEURReq(BaseModel):
     core_or_services_forecast: float
     core_or_services_actual: float
 
+def _half_up(x, digits):
+    f = 10 ** digits
+    return math.floor(x * f + 0.5) / f
+
 @app.post("/api/predict-eur-cpi")
 def predict_eur_cpi(data: EUR_CPIInput, user: str = Depends(require_admin)):
+    """Eurozone Flash CPI Proxy v3: dynamic-weight nowcast from national HICP flashes with a strict DO NOT TRADE gate."""
     check_numbers(data)
+    mode = data.eur_cpi_mode.strip().upper().replace("-", "")
+    if mode not in ("YOY", "MOM"):
+        raise HTTPException(status_code=422, detail="'eur_cpi_mode' must be YoY or MoM.")
+    lead_map = {"BULLISH": 0.05, "NEUTRAL": 0.0, "BEARISH": -0.05}
+    lead = lead_map.get(data.lead_indicator.strip().upper())
+    if lead is None:
+        raise HTTPException(status_code=422, detail="'lead_indicator' must be BULLISH, NEUTRAL or BEARISH.")
     increment_usage(user)
-    sig_ger = _clamp((data.german_states_weighted_cpi - data.eur_cpi_consensus) / 0.3)
-    sig_sf = _clamp(data.spain_france_flash_surprise / 0.2)
-    sig_ttf = _clamp(data.ttf_gas_brent_pct / 8.0)
-    sig_srv = _clamp(((data.hcob_srv_pmi_prices - data.hcob_srv_pmi_prices_prev) + ((data.hcob_srv_pmi_prices - 55.0) * 0.3)) / 4.0)
-    sig_imp = _clamp(data.german_import_ppi_mom / 0.4)
 
-    score = round((sig_ger * 45) + (sig_sf * 25) + (sig_ttf * 15) + (sig_srv * 10) + (sig_imp * 5), 1)
-    buffer = 33.0 if data.is_eu_summer_travel else 25.0
-    reason = "July–August package-holiday / transport window" if data.is_eu_summer_travel else "standard gate"
-    bias, bias_dir, mult, verdict, tier, summary = _gate_verdict(
-        score, buffer, reason, "Eurozone flash CPI",
-        "HOTTER EZ CPI (EUR BULLISH): lean EUR up on ECB hawkish repricing",
-        "COOLER EZ CPI (EUR BEARISH): lean EUR down as ECB easing bets build")
+    de, fr, it, es = data.germany_hicp, data.france_hicp, data.italy_hicp, data.spain_hicp
+    nl, be = data.netherlands_hicp, data.belgium_hicp
+    consensus = data.eur_cpi_consensus
+
+    weighted_sum = (0.278 * de) + (0.203 * fr) + (0.168 * it) + (0.111 * es)
+    total_weight = 0.760
+    if nl is not None:
+        weighted_sum += 0.057 * nl
+        total_weight += 0.057
+    if be is not None:
+        weighted_sum += 0.038 * be
+        total_weight += 0.038
+
+    scaled = weighted_sum / total_weight
+    spread = 0.08 if mode == "YOY" else 0.015
+    predicted = scaled + spread + lead
+    rounded = _half_up(predicted, 1)
+    delta = predicted - consensus
+    coverage = _half_up(total_weight * 100, 1)
+
+    # --- safety gate (a tiny epsilon keeps float noise from flipping a threshold) ---
+    EPS = 1e-9
+    flag_a = abs(delta) < 0.12 - EPS
+    # normalised so negative MoM prints land in the same 0-9 bucket as positive ones
+    hundredths = int(_half_up(((predicted * 100) % 10 + 10) % 10, 0))
+    flag_b = total_weight < 0.85 - EPS and hundredths in (4, 5, 6) and abs(delta) < 0.15 - EPS
+    de_gap, fr_gap = de - consensus, fr - consensus
+    flag_c = ((de_gap >= 0.10 - EPS and fr_gap <= -0.10 + EPS) or (de_gap <= -0.10 + EPS and fr_gap >= 0.10 - EPS))
+
+    reasons = []
+    if flag_a:
+        reasons.append("Spread < 0.12% noise threshold")
+    if flag_b:
+        reasons.append("Rounding cliff danger zone")
+    if flag_c:
+        reasons.append("DE/FR core divergence")
+
+    edge_txt = f"{delta:+.2f}%"
+    if reasons:
+        signal, bias, bias_dir, mult = "DO NOT TRADE (UNSURE)", "NEUTRAL", 0, 0.55
+        note = f"Trade blocked to protect capital: {'; '.join(reasons)}."
+    elif delta >= 0.12 - EPS:
+        signal, bias, bias_dir, mult = "STRONG BUY EUR", "HOTTER", 1, (1.2 if abs(delta) >= 0.25 else 0.9)
+        note = f"Proxy is {edge_txt} above consensus with no safety flags, so the confirmed bias is bullish EUR."
+    else:
+        signal, bias, bias_dir, mult = "STRONG SELL EUR", "COOLER", -1, (1.2 if abs(delta) >= 0.25 else 0.9)
+        note = f"Proxy is {edge_txt} below consensus with no safety flags, so the confirmed bias is bearish EUR."
+
     assets = [
         {"pair": "EUR/JPY", "base": 105, "inv": False, "note": "High-beta EUR cross; wait 2 minutes for spreads to normalise"},
         {"pair": "EUR/USD", "base": 78,  "inv": False, "note": "Cleanest follow-through after the 5m candle closes"},
         {"pair": "EUR/GBP", "base": 50,  "inv": False, "note": "Slower mover; confirm the direction on EUR/USD first"},
     ]
-    return _v2_payload(score, buffer, reason, bias, verdict, tier, summary, assets, bias_dir, mult)
+    return {
+        "signal": signal, "bias": bias, "verdict": signal, "tier": f"Coverage: {coverage:.1f}% HICP",
+        "score": round(delta, 2), "summary": note, "note": note, "reasons": reasons,
+        "mode": "YoY" if mode == "YOY" else "MoM",
+        "proxy_rounded": rounded, "predicted_cpi": round(predicted, 4), "consensus": consensus,
+        "surprise_delta": round(delta, 4), "coverage_pct": coverage,
+        "inputs": {"DE": de, "FR": fr, "IT": it, "ES": es, "NL": nl, "BE": be},
+        "flags": {"insufficient_edge": flag_a, "rounding_cliff": flag_b, "core_divergence": flag_c},
+        "pairs": _spike_rows(assets, bias_dir, mult, "DO NOT TRADE"),
+    }
 
 @app.post("/api/predict-eur-pmi")
 def predict_eur_pmi(data: EUR_PMIInput, user: str = Depends(require_admin)):
@@ -2969,19 +3028,35 @@ def index():
       labels: { up: "HAWKISH WAGE-LED JOBS (GBP BULLISH)", down: "SOFT WAGE-LED JOBS (GBP BEARISH)", flat: "NO-TRADE / LOW EDGE" }
     },
     EUR_CPI: {
-      cur: "EUR", prefix: "eurcpi", api: "/api/predict-eur-cpi", title: "Eurozone / German Flash CPI",
-      heading: "Eurozone Flash CPI V2 Leading Proxies", tabLabel: "🇪🇺 EUR Flash CPI V2",
+      cur: "EUR", prefix: "eurcpi", api: "/api/predict-eur-cpi", title: "EUROZONE FLASH CPI PROXY v3",
+      heading: "Eurozone Flash CPI Proxy v3 Inputs", tabLabel: "🇪🇺 EUR Flash CPI v3",
+      selects: [["eur_cpi_mode", "Mode", [["YoY", "YoY (Year-over-Year)"], ["MoM", "MoM (Month-over-Month)"]], "YoY"]],
       fields: [
-        ["eur_cpi_consensus", "Eurozone Flash CPI YoY Consensus (%) [Reference]", 2.1, 0.1],
-        ["german_states_weighted_cpi", "German States Weighted CPI (NRW+BY+HE) [45%]", 2.3, 0.1],
-        ["spain_france_flash_surprise", "Spain / France Flash Surprise (%) [25%]", 0.1, 0.1],
-        ["ttf_gas_brent_pct", "TTF Gas / Brent Monthly % Δ [15%]", 4.0, 0.1],
-        ["hcob_srv_pmi_prices", "HCOB Services PMI Prices [10%]", 55.2, 0.1],
-        ["hcob_srv_pmi_prices_prev", "HCOB Services PMI Prices Prev", 54.0, 0.1],
-        ["german_import_ppi_mom", "German Import PPI MoM (%) [5%]", 0.2, 0.1]
+        ["eur_cpi_consensus", "Market Consensus Forecast (%) *", 2.1, 0.01],
+        ["germany_hicp", "Germany HICP (%) * [27.8%]", 2.3, 0.01],
+        ["france_hicp", "France HICP (%) * [20.3%]", 2.1, 0.01],
+        ["italy_hicp", "Italy HICP (%) * [16.8%]", 1.9, 0.01],
+        ["spain_hicp", "Spain HICP (%) * [11.1%]", 2.5, 0.01],
+        ["netherlands_hicp", "Netherlands HICP (%) [5.7%] — optional, leave blank if not released", "", 0.01, true],
+        ["belgium_hicp", "Belgium HICP (%) [3.8%] — optional, leave blank if not released", "", 0.01, true]
       ],
-      checks: [["is_eu_summer_travel", "July–August Package-Holiday / Transport Window? (Widens No-Trade Gate to ±33)"]],
-      labels: { up: "HOTTER EZ CPI (EUR BULLISH)", down: "COOLER EZ CPI (EUR BEARISH)", flat: "NO-TRADE / LOW EDGE" }
+      selectsAfter: [["lead_indicator", "Lead Indicator Adjustment", [
+        ["BULLISH", "Bullish (+0.05%) — Flash Services Output Prices & TTF Gas both up"],
+        ["NEUTRAL", "Neutral (0.00%) — Mixed / Flat"],
+        ["BEARISH", "Bearish (-0.05%) — Flash Services Output Prices & TTF Gas both down"]], "NEUTRAL"]],
+      checks: [],
+      extraHtml: `<div style="margin-top:0.9rem; padding:0.75rem; border:1px solid var(--border); border-radius:8px; background:#04140f;">
+        <label style="color:var(--gold-bright);">Germany HICP — 4-State Calculator</label>
+        <div class="form-grid">
+          <div><label>NRW (41%)</label><input type="number" id="eurcpi_st_nrw" step="0.01" /></div>
+          <div><label>Bavaria (28%)</label><input type="number" id="eurcpi_st_bay" step="0.01" /></div>
+          <div><label>Baden-Württemberg (21%)</label><input type="number" id="eurcpi_st_bw" step="0.01" /></div>
+          <div><label>Hesse (10%)</label><input type="number" id="eurcpi_st_hes" step="0.01" /></div>
+        </div>
+        <button class="btn-outline" style="width:100%; margin-top:0.6rem;" onclick="calcGermany()">Calculate Germany HICP &amp; fill the box above</button>
+        <p id="eurcpi_st_msg" style="font-size:0.78rem; color:var(--muted); margin-top:0.4rem;">(0.41 × NRW) + (0.28 × Bavaria) + (0.21 × Baden-Württemberg) + (0.10 × Hesse)</p>
+      </div>`,
+      labels: { up: "STRONG BUY EUR", down: "STRONG SELL EUR", flat: "DO NOT TRADE (UNSURE)" }
     },
     EUR_PMI: {
       cur: "EUR", prefix: "eurpmi", api: "/api/predict-eur-pmi", title: "Eurozone Flash PMI",
@@ -3072,13 +3147,15 @@ def index():
     const p = m.prefix;
     const fields = m.fields.map(f =>
       `<div><label>${esc(f[1])}</label><input type="number" id="${p}_${f[0]}" value="${f[2]}" step="${f[3]}" /></div>`).join("");
+    const selHtml = list => (list || []).map(sl =>
+      `<div><label>${esc(sl[1])}</label><select id="${p}_${sl[0]}">${sl[2].map(o => `<option value="${o[0]}"${o[0] === sl[3] ? " selected" : ""}>${esc(o[1])}</option>`).join("")}</select></div>`).join("");
     const checks = m.checks.map(c =>
       `<div class="check-row"><input type="checkbox" id="${p}_${c[0]}" /><label for="${p}_${c[0]}" style="margin:0; color:var(--text); cursor:pointer;">${esc(c[1])}</label></div>`).join("");
     const note = m.note ? `<p style="font-size:0.8rem; color:var(--muted); margin-top:0.75rem;">${esc(m.note)}</p>` : "";
     return `<div id="view${tabIdFor(key)}" class="grid hidden">
       <div class="card desk-only">
         <h2><span>1. ${esc(m.heading)}</span> <span style="font-size:0.75rem; color:var(--muted);">${FLAG[m.cur]} ${m.cur} V2</span></h2>
-        <div class="form-grid">${fields}${checks}</div>${note}
+        <div class="form-grid">${selHtml(m.selects)}${fields}${selHtml(m.selectsAfter)}${checks}</div>${m.extraHtml || ""}${note}
         <button class="btn" style="width:100%; margin-top:1rem;" onclick="calcGeneric('${key}')">Calculate ${esc(m.heading.replace(' Leading Proxies', ''))} Outcome &amp; FX Spikes</button>
       </div>
       <div>
@@ -3107,14 +3184,53 @@ def index():
   function genericPayload(key) {
     const m = MODS[key];
     const out = {};
-    m.fields.forEach(f => { out[f[0]] = Number(document.getElementById(`${m.prefix}_${f[0]}`).value); });
+    m.fields.forEach(f => {
+      const raw = document.getElementById(`${m.prefix}_${f[0]}`).value;
+      out[f[0]] = (f[4] && String(raw).trim() === "") ? null : Number(raw);
+    });
+    (m.selects || []).concat(m.selectsAfter || []).forEach(sl => { out[sl[0]] = document.getElementById(`${m.prefix}_${sl[0]}`).value; });
     m.checks.forEach(c => { out[c[0]] = document.getElementById(`${m.prefix}_${c[0]}`).checked; });
     return out;
+  }
+
+  function calcGermany() {
+    const ids = ["nrw", "bay", "bw", "hes"];
+    const w = [0.41, 0.28, 0.21, 0.10];
+    const vals = ids.map(i => document.getElementById("eurcpi_st_" + i).value);
+    const msg = document.getElementById("eurcpi_st_msg");
+    if (vals.some(v => String(v).trim() === "" || isNaN(Number(v)))) { msg.innerText = "Enter all four state prints first."; return; }
+    const de = vals.reduce((a, v, i) => a + Number(v) * w[i], 0);
+    document.getElementById("eurcpi_germany_hicp").value = (Math.round(de * 100) / 100).toFixed(2);
+    msg.innerText = "Germany HICP set to " + (Math.round(de * 100) / 100).toFixed(2) + "%.";
+  }
+
+  function eurCpiLines(d) {
+    if (d.proxy_rounded === undefined || !d.inputs) return `<p style="font-size:0.88rem; color:#d1d5db;">${esc(d.summary || "")}</p>`;
+    const sgn = d.surprise_delta >= 0 ? "+" : "";
+    let inp = `DE: ${d.inputs.DE}% | FR: ${d.inputs.FR}% | IT: ${d.inputs.IT}% | ES: ${d.inputs.ES}%`;
+    if (d.inputs.NL !== null && d.inputs.NL !== undefined) inp += ` | NL: ${d.inputs.NL}%`;
+    if (d.inputs.BE !== null && d.inputs.BE !== undefined) inp += ` | BE: ${d.inputs.BE}%`;
+    const tags = (d.reasons || []).map(r => `<span class="pill up" style="margin-right:0.35rem;">${esc(r)}</span>`).join("");
+    return `<div style="font-weight:700; margin-bottom:0.35rem;">Proxy: ${d.proxy_rounded.toFixed(1)}% (${d.predicted_cpi.toFixed(2)}%) vs. Consensus: ${esc(d.consensus)}% | Edge: ${sgn}${d.surprise_delta.toFixed(2)}%</div>
+      <div style="font-size:0.85rem; color:#d1d5db; margin-bottom:0.35rem;">${esc(inp)}</div>
+      ${tags ? `<div style="margin-bottom:0.35rem;">${tags}</div>` : ""}
+      <div style="font-size:0.88rem; color:#d1d5db;">${esc(d.note || d.summary || "")}</div>`;
   }
 
   function renderGeneric(key, d) {
     const m = MODS[key];
     const p = m.prefix;
+    if (key === "EUR_CPI" && d.proxy_rounded !== undefined) {
+      const up = d.bias === "HOTTER", down = d.bias === "COOLER";
+      const el = document.getElementById(p + "Bias");
+      el.innerText = d.signal;
+      el.className = "big-score " + (up ? "bull" : down ? "bear" : "neut");
+      document.getElementById(p + "Tier").innerText = d.tier || "";
+      document.getElementById(p + "Score").innerText = `Edge: ${d.surprise_delta >= 0 ? "+" : ""}${d.surprise_delta.toFixed(2)}%`;
+      document.getElementById(p + "Summary").innerHTML = eurCpiLines(d);
+      document.getElementById(p + "Pairs").innerHTML = pairRows(d.pairs);
+      return;
+    }
     const up = d.bias === "HOTTER", down = d.bias === "COOLER";
     const el = document.getElementById(p + "Bias");
     el.innerText = up ? m.labels.up : down ? m.labels.down : m.labels.flat;
@@ -3312,6 +3428,7 @@ def index():
   function metricFor(key, d) {
     const sign = d.score > 0 ? "+" : "";
     if (key === "USD_NFP") return `Edge: ${sign}${d.score}K`;
+    if (key === "EUR_CPI" && d.surprise_delta !== undefined) return `Edge: ${d.surprise_delta >= 0 ? "+" : ""}${d.surprise_delta.toFixed(2)}%`;
     if (key === "USD_FOMC") return `Hawkish score: ${sign}${d.score} | Gate: ±${d.gate} | Reversal risk: ${d.reversal_risk}`;
     if (d.buffer !== undefined) return `Score: ${sign}${d.score} | Gate: ±${d.buffer}`;
     return `Score: ${sign}${d.score}`;
@@ -3347,15 +3464,17 @@ def index():
     const tier = d.tier || (d.crowded ? "CROWDED CONSENSUS (BUY RUMOR / SELL FACT RISK)" : "");
     const idp = "cdec_" + ev.event_id;
     const decoder = decodedHtml(ev);
+    const isV3 = key === "EUR_CPI" && d.proxy_rounded !== undefined;
+    const bodyHtml = isV3 ? eurCpiLines(d) : `<p style="font-size:0.88rem; color:#d1d5db;">${esc(d.summary || "")}</p>`;
     return `<div class="card" style="border-color:var(--gold);">
       <div class="desk-badge" style="margin-bottom:0.9rem;">🏛️ A&amp;M Group Research Desk — Official Signal (Updated: ${esc(fmtTime(ev.updated_at))})</div>
       <h2><span>${esc(FLAG[ev.currency] || "")} ${esc(ev.title)} — Asset &amp; FX Spike Matrix</span> <span style="font-size:0.75rem; color:var(--gold);">${esc(tier)}</span></h2>
       <div class="verdict-box">
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.4rem; margin-bottom:0.4rem;">
-          <span class="big-score ${up ? "bull" : down ? "bear" : "neut"}">${esc(up ? L.up : down ? L.down : L.flat)}</span>
+          <span class="big-score ${up ? "bull" : down ? "bear" : "neut"}">${esc(isV3 ? d.signal : (up ? L.up : down ? L.down : L.flat))}</span>
           <span style="font-weight:700;">${esc(metricFor(key, d))}</span>
         </div>
-        <p style="font-size:0.88rem; color:#d1d5db;">${esc(d.summary || "")}</p>
+        ${bodyHtml}
       </div>
       <div style="overflow-x:auto;"><table>
         <thead><tr><th>Pair / Asset</th><th>Direction</th><th>Est. 15m Range</th><th>Execution Note</th></tr></thead>
@@ -3472,11 +3591,13 @@ def index():
       ["Adzuna Job Ads % Δ [8%]", "Monthly, first week", null]
     ] },
     { key: "EUR_CPI", cur: "EUR", main: "Eurostat flash, around month-end, 13:00 EAT", rows: [
-      ["German States Weighted CPI (NRW, Bavaria, Hesse) [45%]", "Morning of the German flash CPI", "FF"],
-      ["Spain / France Flash Surprise [25%]", "Same morning: France 10:45, Spain 11:00", "FF"],
-      ["TTF Gas / Brent % Δ [15%]", "Daily, use ⚡ Auto-Fetch", null],
-      ["HCOB Services PMI Prices [10%]", "Flash ~3rd/4th week 12:00; final 3rd business day", "PMI"],
-      ["German Import PPI MoM [5%]", "Around the 20th, 10:00", "FF"]
+      ["Germany HICP: NRW, Bavaria, Baden-Württemberg, Hesse [27.8%]", "Morning of the Eurostat flash (state offices, then Destatis)", "FF"],
+      ["France HICP flash [20.3%]", "Same morning, about 10:45", "FF"],
+      ["Italy HICP flash [16.8%]", "Same morning, check the calendar for the time", "FF"],
+      ["Spain HICP flash [11.1%]", "Same morning, about 11:00", "FF"],
+      ["Netherlands HICP [5.7%], optional", "Same morning if published, else leave blank", "FF"],
+      ["Belgium HICP [3.8%], optional", "Same morning if published, else leave blank", "FF"],
+      ["Lead indicator: Flash Services Output Prices and TTF Gas (±0.05%)", "Flash PMI ~3rd/4th week 12:00; TTF daily", "PMI"]
     ] },
     { key: "EUR_PMI", cur: "EUR", main: "HCOB Flash, 12:00 EAT (Germany 11:30, France 11:15)", rows: [
       ["German Flash PMI [40%]", "Flash day ~3rd/4th week, 11:30", "PMI"],
