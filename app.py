@@ -9,6 +9,8 @@ import hashlib
 import secrets
 import sqlite3
 import logging
+import csv
+import io
 import threading
 from typing import Optional
 from collections import defaultdict, deque
@@ -1492,7 +1494,9 @@ class EUR_CPIInput(BaseModel):
     spain_hicp: float = 2.5
     netherlands_hicp: Optional[float] = None  # optional, leave blank if not released
     belgium_hicp: Optional[float] = None      # optional, leave blank if not released
-    lead_indicator: str = "NEUTRAL"           # BULLISH (+0.05) / NEUTRAL (0) / BEARISH (-0.05)
+    hcob_srv_prices: float = 55.2             # HCOB flash services output prices index, this month
+    hcob_srv_prices_prev: float = 54.0        # same index, previous month
+    ttf_gas_brent_pct: float = 4.0            # TTF gas / Brent monthly % change (Auto-Fetch fills this)
 
 class EUR_PMIInput(BaseModel):
     user_email: str
@@ -1520,11 +1524,16 @@ def predict_eur_cpi(data: EUR_CPIInput, user: str = Depends(require_admin)):
     mode = data.eur_cpi_mode.strip().upper().replace("-", "")
     if mode not in ("YOY", "MOM"):
         raise HTTPException(status_code=422, detail="'eur_cpi_mode' must be YoY or MoM.")
-    lead_map = {"BULLISH": 0.05, "NEUTRAL": 0.0, "BEARISH": -0.05}
-    lead = lead_map.get(data.lead_indicator.strip().upper())
-    if lead is None:
-        raise HTTPException(status_code=422, detail="'lead_indicator' must be BULLISH, NEUTRAL or BEARISH.")
     increment_usage(user)
+    # lead indicator is derived: services output prices and gas both up = +0.05, both down = -0.05, otherwise 0
+    srv_change = data.hcob_srv_prices - data.hcob_srv_prices_prev
+    gas_change = data.ttf_gas_brent_pct
+    if srv_change > 0 and gas_change > 0:
+        lead, lead_label = 0.05, "BULLISH (+0.05%)"
+    elif srv_change < 0 and gas_change < 0:
+        lead, lead_label = -0.05, "BEARISH (-0.05%)"
+    else:
+        lead, lead_label = 0.0, "NEUTRAL (0.00%)"
 
     de, fr, it, es = data.germany_hicp, data.france_hicp, data.italy_hicp, data.spain_hicp
     nl, be = data.netherlands_hicp, data.belgium_hicp
@@ -1582,7 +1591,7 @@ def predict_eur_cpi(data: EUR_CPIInput, user: str = Depends(require_admin)):
     return {
         "signal": signal, "bias": bias, "verdict": signal, "tier": f"Coverage: {coverage:.1f}% HICP",
         "score": round(delta, 2), "summary": note, "note": note, "reasons": reasons,
-        "mode": "YoY" if mode == "YOY" else "MoM",
+        "mode": "YoY" if mode == "YOY" else "MoM", "lead_adjustment": lead, "lead_label": lead_label,
         "proxy_rounded": rounded, "predicted_cpi": round(predicted, 4), "consensus": consensus,
         "surprise_delta": round(delta, 4), "coverage_pct": coverage,
         "inputs": {"DE": de, "FR": fr, "IT": it, "ES": es, "NL": nl, "BE": be},
@@ -1773,6 +1782,9 @@ def publish_event(req: PublishEventReq, admin: str = Depends(require_admin)):
                 raise HTTPException(status_code=409, detail="The queue already holds the maximum number of events. Remove one first.")
             events[event_id] = record
             _write_events(conn, cur, events)
+            if record["released"]:
+                with _CPI_LOCK:
+                    _release_touch(conn, cur, record)
             conn.commit()
         except HTTPException:
             conn.rollback()
@@ -1806,7 +1818,10 @@ def publish_decode(req: PublishDecodeReq, admin: str = Depends(require_admin)):
             events = _read_events(cur, ph_for(conn))
             if req.event_id not in events:
                 raise HTTPException(status_code=404, detail="Schedule or release this event first, then publish the decoded result.")
-            events[req.event_id]["decoded"] = {"verdict": verdict, "plan": plan, "updated_at": _utc_iso()}
+            ts = _utc_iso()
+            events[req.event_id]["decoded"] = {"verdict": verdict, "plan": plan, "updated_at": ts}
+            with _CPI_LOCK:
+                _release_touch(conn, cur, events[req.event_id], verdict, ts)
             _write_events(conn, cur, events)
             conn.commit()
         except HTTPException:
@@ -1894,6 +1909,671 @@ def next_events(request: Request, response: Response, user: str = Depends(curren
     todays = [shape(ev) for r, ev in live if r.strftime("%Y-%m-%d") == next_date]
     return {"server_time": server_time, "next_date": next_date, "events": todays}
 
+# ---------------------------------------------------------------------------
+# Eurozone CPI Post-Release Decoder v2 + admin ledger / calibration
+# Config, ledger rows and everything admin-only live in site_settings (no schema change).
+# ---------------------------------------------------------------------------
+DECODER_CONFIG_DEFAULTS = {
+    "weights": {"services": 0.40, "core": 0.40, "headline": 0.20},
+    "deadzoneThreshold": 0.08,
+    "standardThreshold": 0.10,
+    "coldEntryThreshold": 0.15,   # higher bar when Proxy v3 said DO NOT TRADE
+    "riskPerTradePct": 0.5,       # half-risk on post-release spikes
+    "timeStopMinutes": 20,        # exit by 11:20 CET if the target is not hit
+    "releaseTimeCET": "11:00",
+    "trapThreshold": 0.10,        # headline vs core/services divergence size
+    "trapSpikePips": 8,           # EUR/USD 1-minute spike needed for a trap
+    "killSwitchScore": 0.05,      # proxy contradiction level
+    "conflictThreshold": 0.10,
+    "maxSpikePips": 30,           # skip EUR/USD if the first spike was already this big
+    "pairs": {
+        "EURUSD": {"stopPips": 12, "targetR": 1.8, "pipValuePerLot": 10},
+        "EURGBP": {"stopPips": 10, "targetR": 1.8, "pipValuePerLot": 12.7},
+        "EURJPY": {"stopPips": 20, "targetR": 1.8, "pipValuePerLot": 6.5},
+    },
+}
+CPI_CONFIG_KEY = "cpi_decoder_config"
+CPI_LEDGER_KEY = "cpi_decoder_ledger"
+CPI_LEDGER_MAX_ROWS = 3000
+CPI_LEDGER_MAX_CHARS = 3_000_000
+PAIR_CODES = {"EUR/USD": "EURUSD", "EUR/GBP": "EURGBP", "EUR/JPY": "EURJPY"}
+CPI_OUTCOMES = ("WIN", "LOSS", "TIME_EXIT", "SKIPPED")
+PROXY_SIGNALS = ("STRONG BUY EUR", "STRONG SELL EUR", "DO NOT TRADE")
+_CPI_LOCK = threading.Lock()
+
+def _clone(obj):
+    return json.loads(json.dumps(obj))
+
+def _setting_get(cur, ph, key):
+    cur.execute(f"SELECT setting_value FROM site_settings WHERE setting_key = {ph}", (key,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row["setting_value"])
+    except Exception:
+        return None
+
+def _setting_set(conn, cur, key, obj, max_chars):
+    text = json.dumps(obj, separators=(",", ":"))
+    if len(text) > max_chars:
+        raise HTTPException(status_code=413, detail="Stored data is too large. Export the ledger and contact support.")
+    if is_pg(conn):
+        cur.execute(
+            "INSERT INTO site_settings (setting_key, setting_value) VALUES (%s, %s) "
+            "ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value",
+            (key, text)
+        )
+    else:
+        cur.execute("INSERT OR REPLACE INTO site_settings (setting_key, setting_value) VALUES (?, ?)", (key, text))
+
+def _num(v, lo, hi, name):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < lo or v > hi:
+        raise HTTPException(status_code=422, detail=f"'{name}' must be a number between {lo} and {hi}.")
+    return float(v)
+
+def _validate_cfg(inc, base):
+    cfg = _clone(base)
+    w = inc.get("weights")
+    if isinstance(w, dict):
+        for k in ("services", "core", "headline"):
+            if k in w:
+                cfg["weights"][k] = _num(w[k], 0, 1, "weights." + k)
+    if abs(sum(cfg["weights"].values()) - 1.0) > 0.001:
+        raise HTTPException(status_code=422, detail="The three weights must add up to 1.00.")
+    scalars = {"deadzoneThreshold": (0, 1), "standardThreshold": (0, 1), "coldEntryThreshold": (0, 1),
+               "riskPerTradePct": (0.01, 5), "timeStopMinutes": (1, 120), "trapThreshold": (0, 1),
+               "trapSpikePips": (0, 100), "killSwitchScore": (0, 1), "conflictThreshold": (0, 1),
+               "maxSpikePips": (1, 500)}
+    for k, (lo, hi) in scalars.items():
+        if k in inc:
+            cfg[k] = _num(inc[k], lo, hi, k)
+    if not (cfg["deadzoneThreshold"] <= cfg["standardThreshold"] <= cfg["coldEntryThreshold"]):
+        raise HTTPException(status_code=422, detail="Thresholds must satisfy: deadzone <= standard <= cold-entry.")
+    pairs = inc.get("pairs")
+    if isinstance(pairs, dict):
+        limits = {"stopPips": (1, 500), "targetR": (0.5, 10), "pipValuePerLot": (0.01, 1000)}
+        for code in cfg["pairs"]:
+            p = pairs.get(code)
+            if isinstance(p, dict):
+                for k, (lo, hi) in limits.items():
+                    if k in p:
+                        cfg["pairs"][code][k] = _num(p[k], lo, hi, f"pairs.{code}.{k}")
+    return cfg
+
+def _load_cfg(cur, ph):
+    saved = _setting_get(cur, ph, CPI_CONFIG_KEY)
+    cfg = _clone(DECODER_CONFIG_DEFAULTS)
+    if isinstance(saved, dict):
+        try:
+            cfg = _validate_cfg(saved, cfg)
+        except HTTPException:
+            pass
+    return cfg
+
+def _exit_time(cfg):
+    hh, mm = (int(x) for x in cfg["releaseTimeCET"].split(":"))
+    t = hh * 60 + mm + int(cfg["timeStopMinutes"])
+    return f"{t // 60:02d}:{t % 60:02d} CET"
+
+class CPIDecodeV2Req(BaseModel):
+    proxy_signal: Optional[str] = None
+    account_balance: float = 0.0
+    headline_actual: float
+    headline_forecast: float
+    core_actual: float
+    core_forecast: float
+    services_actual: float = 0.0
+    services_benchmark: float = 0.0
+    services_basis: str = "NONE"      # FORECAST, PRIOR or NONE
+    spike_1m_pips: float = 0.0        # EUR/USD, 11:01 close minus 10:59 close, in pips
+    reclaimed: bool = False           # 11:01 candle reclaimed (or broke back through) the 10:59 price
+    uk_news: bool = False
+    risk_off: bool = False
+
+def _norm_proxy(p):
+    p = (p or "DO NOT TRADE").strip().upper()
+    if p.startswith("DO NOT TRADE"):
+        return "DO NOT TRADE"
+    if p in PROXY_SIGNALS:
+        return p
+    raise HTTPException(status_code=422, detail="'proxy_signal' must be STRONG BUY EUR, STRONG SELL EUR or DO NOT TRADE.")
+
+def _norm_basis(b):
+    b = (b or "NONE").strip().upper()
+    if b not in ("FORECAST", "PRIOR", "NONE"):
+        raise HTTPException(status_code=422, detail="'services_basis' must be FORECAST, PRIOR or NONE.")
+    return b
+
+def _pair_plans(direction, classification, r, cfg):
+    side = "BUY" if direction == "BUY" else "SELL"
+    trap = classification == "CONFIRMED TRAP"
+    exit_txt = _exit_time(cfg)
+    plans = {}
+    balance = r.account_balance
+    for pair, code in PAIR_CODES.items():
+        pc = cfg["pairs"][code]
+        stop = pc["stopPips"]
+        target = round(stop * pc["targetR"], 1)
+        status, text = "TRADE", ""
+        entry = (f"enter once the 1-minute candle closes back through the 10:59 CET price" if trap
+                 else "enter on a 38.2%–50% pullback of the 11:01 CET 1-minute bar")
+        if code == "EURUSD":
+            if abs(r.spike_1m_pips) > cfg["maxSpikePips"]:
+                status = "SKIP"
+                text = f"SKIP EUR/USD — the first 1-minute spike ({abs(r.spike_1m_pips):g} pips) is over the {cfg['maxSpikePips']:g} pip limit, so the move is already done."
+            else:
+                text = (f"{side} EUR/USD (primary rate play): {entry}. Stop: {stop:g} pips beyond the "
+                        f"{'spike extreme' if trap else '10:59 CET anchor'}. Target: {target:g} pips ({pc['targetR']:g}R). Hard exit at {exit_txt}.")
+        elif code == "EURGBP":
+            if r.uk_news:
+                status = "SKIP"
+                text = "SKIP EUR/GBP — UK high-impact news today, so the UK catalyst overrides the Euro print."
+            else:
+                text = (f"{side} EUR/GBP (policy divergence filter): {entry}. Tight {stop:g} pip stop, "
+                        f"{target:g} pip target, time stop at {exit_txt}.")
+        else:
+            if side == "BUY" and r.risk_off:
+                status = "SKIP"
+                text = "SKIP EUR/JPY — a hot print is tanking equities (DAX down more than 0.5%), so JPY safe-haven buying will fight EUR strength."
+            else:
+                extra = " Risk-off supports this sell, but spreads are wide, so keep size small." if (side == "SELL" and r.risk_off) else ""
+                text = (f"{side} EUR/JPY (risk-sentiment filter): {entry}. {stop:g} pip stop, "
+                        f"{target:g} pip target, time stop at {exit_txt}.{extra}")
+        plan = {"status": status, "text": text, "stop": stop, "target": target,
+                "target_r": pc["targetR"], "pip_value": pc["pipValuePerLot"]}
+        if status == "TRADE" and balance > 0:
+            risk_cash = balance * cfg["riskPerTradePct"] / 100.0
+            plan["lot"] = math.floor((risk_cash / (stop * pc["pipValuePerLot"])) * 100) / 100
+        plans[pair] = plan
+    return plans
+
+def _cpi_decode_v2(r, proxy, cfg):
+    EPS = 1e-9
+    h = round(r.headline_actual - r.headline_forecast, 4)
+    c = round(r.core_actual - r.core_forecast, 4)
+    basis = _norm_basis(r.services_basis)
+    s = None if basis == "NONE" else round(r.services_actual - r.services_benchmark, 4)
+    w = cfg["weights"]
+    if s is None:
+        ecb = (w["core"] * c + w["headline"] * h) / (w["core"] + w["headline"])
+    else:
+        ecb = (w["services"] * s) + (w["core"] * c) + (w["headline"] * h)
+    ecb = round(ecb, 4)
+    min_th = cfg["coldEntryThreshold"] if proxy == "DO NOT TRADE" else cfg["standardThreshold"]
+    T = cfg["trapThreshold"]
+    ks = cfg["killSwitchScore"]
+    contradicted = ((proxy == "STRONG BUY EUR" and ecb <= -ks + EPS) or (proxy == "STRONG SELL EUR" and ecb >= ks - EPS))
+    s_bull = s is None or s >= T - EPS
+    s_bear = s is None or s <= -T + EPS
+    bull_pat = h <= -T + EPS and c >= T - EPS and s_bull and r.spike_1m_pips <= -cfg["trapSpikePips"] + EPS
+    bear_pat = h >= T - EPS and c <= -T + EPS and s_bear and r.spike_1m_pips >= cfg["trapSpikePips"] - EPS
+
+    direction, label, classification, summary = None, "STAND ASIDE", "STAND ASIDE", ""
+    if bull_pat or bear_pat:
+        d_word = "bullish" if bull_pat else "bearish"
+        if r.reclaimed:
+            direction = "BUY" if bull_pat else "SELL"
+            label = f"CONFIRMED TRAP ({d_word.upper()} REVERSAL)"
+            classification = "CONFIRMED TRAP"
+            summary = (f"Headline {'missed' if bull_pat else 'beat'} but core"
+                       f"{' and services' if s is not None else ''} pointed the other way, and the 1-minute candle has "
+                       f"{'reclaimed' if bull_pat else 'broken back through'} the 10:59 CET price. Bias: {d_word} reversal.")
+        else:
+            label = "STAND ASIDE (TRAP PENDING)"
+            summary = ("The divergence pattern is there, but the 1-minute candle has not "
+                       f"{'reclaimed' if bull_pat else 'broken back through'} the 10:59 CET price. Wait for it or skip.")
+    elif contradicted:
+        label = "STAND ASIDE (PROXY INVALIDATED)"
+        summary = f"The proxy said {proxy} but the print contradicts it."
+    elif abs(ecb) < cfg["deadzoneThreshold"] - EPS or abs(ecb) < min_th - EPS:
+        summary = (f"The blended ECB score ({ecb:+.2f}) is inside the noise zone"
+                   f"{' (higher bar because the proxy said DO NOT TRADE)' if proxy == 'DO NOT TRADE' else ''}.")
+    elif ((h > 0) != (c > 0)) and abs(h) >= cfg["conflictThreshold"] - EPS and abs(c) >= cfg["conflictThreshold"] - EPS:
+        label = "STAND ASIDE (CONFLICTING DATA)"
+        summary = "Headline and core point in opposite directions and the trap conditions are not met."
+    elif ecb >= min_th - EPS and c > 0 and (s is None or s >= 0):
+        direction, label, classification = "BUY", "CLEAN BEAT (BULLISH EUR)", "CLEAN BEAT"
+        summary = f"Core{' and services' if s is not None else ''} beat and the blended ECB score is {ecb:+.2f}. Bias: bullish EUR."
+    elif ecb <= -min_th + EPS and c < 0 and (s is None or s <= 0):
+        direction, label, classification = "SELL", "CLEAN MISS (BEARISH EUR)", "CLEAN MISS"
+        summary = f"Core{' and services' if s is not None else ''} missed and the blended ECB score is {ecb:+.2f}. Bias: bearish EUR."
+    else:
+        summary = "The print does not meet the clean beat or clean miss conditions."
+
+    close_note = ("The proxy contradicts this print: close any pre-release position immediately."
+                  if contradicted else "")
+    return {
+        "label": label, "classification": classification, "direction": direction,
+        "ecb_score": ecb, "min_threshold": min_th, "h_surp": h, "c_surp": c, "s_surp": s,
+        "services_basis": basis, "summary": summary, "close_note": close_note,
+        "proxy_signal": proxy, "spike_1m_pips": r.spike_1m_pips, "reclaimed": bool(r.reclaimed),
+        "uk_news": bool(r.uk_news), "risk_off": bool(r.risk_off),
+        "risk_pct": cfg["riskPerTradePct"], "exit_time": _exit_time(cfg),
+        "pairs": _pair_plans(direction, classification, r, cfg) if direction else {},
+    }
+
+def _client_details(res):
+    """Everything a member may see: the verdict and plain-language plans. No lots, balance, score or thresholds."""
+    return {
+        "label": res["label"], "classification": res["classification"], "direction": res["direction"],
+        "h_surp": res["h_surp"], "c_surp": res["c_surp"], "s_surp": res["s_surp"],
+        "services_basis": res["services_basis"], "summary": res["summary"], "close_note": res["close_note"],
+        "risk_pct": res["risk_pct"], "exit_time": res["exit_time"],
+        "pairs": {p: {k: v for k, v in plan.items() if k != "lot"} for p, plan in res["pairs"].items()},
+    }
+
+def _calc_r(row):
+    out = row.get("outcome")
+    if out not in ("WIN", "LOSS", "TIME_EXIT"):
+        return None
+    stop = row.get("stop_pips") or 0
+    net = row.get("net_pips")
+    if net is not None and stop:
+        return round(net / stop, 2)
+    if out == "WIN":
+        return float(row.get("target_r") or 0)
+    if out == "LOSS":
+        return -1.0
+    return 0.0
+
+def _ledger_rows(res, release_utc, cfg, decode_ts):
+    date = release_utc[:10]
+    rows = {}
+    for pair, code in PAIR_CODES.items():
+        plan = res["pairs"].get(pair)
+        if res["classification"] == "STAND ASIDE":
+            outcome, plan_status = "NO_SIGNAL", "NONE"
+        elif plan and plan["status"] == "SKIP":
+            outcome, plan_status = "SKIPPED", "SKIP"
+        else:
+            outcome, plan_status = "PENDING", "TRADE"
+        rows[f"{date}|{code}"] = {
+            "id": f"{date}|{code}", "release_date": date, "release_utc": release_utc, "pair": pair,
+            "proxy_signal": res["proxy_signal"], "classification": res["classification"], "label": res["label"],
+            "ecb_score": res["ecb_score"], "h_surp": res["h_surp"], "c_surp": res["c_surp"], "s_surp": res["s_surp"],
+            "services_basis": res["services_basis"], "spike_1m_pips": res["spike_1m_pips"],
+            "reclaimed": res["reclaimed"], "uk_news": res["uk_news"], "risk_off": res["risk_off"],
+            "plan_status": plan_status, "outcome": outcome, "net_pips": None, "r_multiple": None,
+            "stop_pips": cfg["pairs"][code]["stopPips"], "target_r": cfg["pairs"][code]["targetR"],
+            "manual": False, "decoded_at": decode_ts, "logged_at": None, "config": cfg,
+        }
+    return rows
+
+def _merge_ledger(ledger, new_rows):
+    for rid, row in new_rows.items():
+        old = ledger.get(rid)
+        if old and old.get("manual"):
+            for k in ("outcome", "net_pips", "r_multiple", "logged_at", "manual"):
+                row[k] = old.get(k)
+        ledger[rid] = row
+    if len(ledger) > CPI_LEDGER_MAX_ROWS:
+        for rid in sorted(ledger, key=lambda k: ledger[k].get("release_date", ""))[: len(ledger) - CPI_LEDGER_MAX_ROWS]:
+            del ledger[rid]
+
+def _ledger_stats(rows):
+    out = {}
+    for cls in ("CLEAN BEAT", "CLEAN MISS", "CONFIRMED TRAP"):
+        done = [r for r in rows if r.get("classification") == cls and r.get("outcome") in ("WIN", "LOSS", "TIME_EXIT")]
+        n = len(done)
+        wins = sum(1 for r in done if r["outcome"] == "WIN")
+        rs = [r["r_multiple"] for r in done if r.get("r_multiple") is not None]
+        out[cls] = {
+            "n": n, "wins": wins, "win_rate": round(wins / n * 100, 1) if n else None,
+            "net_pips": round(sum(r.get("net_pips") or 0 for r in done), 1),
+            "avg_r": round(sum(rs) / len(rs), 2) if rs else None, "warning": False,
+        }
+    trap = out["CONFIRMED TRAP"]
+    trap["warning"] = trap["n"] >= 5 and trap["win_rate"] is not None and trap["win_rate"] < 45
+    return {
+        "by_class": out,
+        "pending": sum(1 for r in rows if r.get("outcome") == "PENDING"),
+        "skipped": sum(1 for r in rows if r.get("outcome") == "SKIPPED"),
+        "no_signal": sum(1 for r in rows if r.get("outcome") == "NO_SIGNAL"),
+        "releases": len({r.get("release_date") for r in rows}),
+    }
+
+def _release_for(events, event_id, supplied):
+    if supplied:
+        return _parse_release(supplied).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ev = events.get(event_id) or events.get("EUR_CPI")
+    if ev and ev.get("release_utc"):
+        return ev["release_utc"]
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+@app.get("/api/admin/cpi-config")
+def get_cpi_config(admin: str = Depends(require_admin)):
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        return {"config": _load_cfg(cur, ph_for(conn)), "defaults": DECODER_CONFIG_DEFAULTS}
+    finally:
+        cur.close(); conn.close()
+
+class CPIConfigReq(BaseModel):
+    config: dict
+
+@app.post("/api/admin/cpi-config")
+def save_cpi_config(req: CPIConfigReq, admin: str = Depends(require_admin)):
+    with _CPI_LOCK:
+        conn = get_db_conn(); cur = conn.cursor()
+        try:
+            ph = ph_for(conn)
+            cfg = _validate_cfg(req.config, _load_cfg(cur, ph))
+            _setting_set(conn, cur, CPI_CONFIG_KEY, cfg, 20_000)
+            conn.commit()
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback(); log.exception("Saving decoder config failed")
+            raise HTTPException(status_code=500, detail=f"Could not save the config: {_first_line(e)}")
+        finally:
+            cur.close(); conn.close()
+    log.info("CPI decoder config updated by admin")
+    return {"status": "ok", "config": cfg}
+
+@app.post("/api/admin/cpi-decode")
+def cpi_decode(req: CPIDecodeV2Req, admin: str = Depends(require_admin)):
+    check_numbers(req)
+    proxy = _norm_proxy(req.proxy_signal)
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        cfg = _load_cfg(cur, ph_for(conn))
+    finally:
+        cur.close(); conn.close()
+    res = _cpi_decode_v2(req, proxy, cfg)
+    res["config_used"] = cfg   # admin only
+    return res
+
+class PublishCPIDecodeReq(BaseModel):
+    event_id: str
+    inputs: CPIDecodeV2Req
+
+@app.post("/api/admin/publish-cpi-decode")
+def publish_cpi_decode(req: PublishCPIDecodeReq, admin: str = Depends(require_admin)):
+    """Decode on the server with the saved config, send the plain-language result to the client card
+    and write the release into the ledger (so every released decode is accounted for)."""
+    check_numbers(req.inputs)
+    if _event_module(req.event_id, "EUR") != "CPI":
+        raise HTTPException(status_code=422, detail="This decoder is for the EUR CPI event only.")
+    with _EVENTS_LOCK, _CPI_LOCK:
+        conn = get_db_conn(); cur = conn.cursor()
+        try:
+            ph = ph_for(conn)
+            events = _read_events(cur, ph)
+            ev = events.get(req.event_id)
+            if not ev:
+                raise HTTPException(status_code=404, detail="Schedule or release this event first, then publish the decoded result.")
+            cfg = _load_cfg(cur, ph)
+            proxy = _norm_proxy(req.inputs.proxy_signal or (ev.get("result") or {}).get("signal"))
+            res = _cpi_decode_v2(req.inputs, proxy, cfg)
+            ts = _utc_iso()
+            plan_line = res["summary"] + ((" " + res["close_note"]) if res["close_note"] else "")
+            ev["decoded"] = {"verdict": res["label"], "plan": plan_line, "updated_at": ts, "details": _client_details(res)}
+            events[req.event_id] = ev
+            _write_events(conn, cur, events)
+            _release_touch(conn, cur, ev, res["label"], ts)
+            ledger = _setting_get(cur, ph, CPI_LEDGER_KEY) or {}
+            _merge_ledger(ledger, _ledger_rows(res, ev["release_utc"], cfg, ts))
+            _setting_set(conn, cur, CPI_LEDGER_KEY, ledger, CPI_LEDGER_MAX_CHARS)
+            conn.commit()
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback(); log.exception("Publishing CPI decode failed")
+            raise HTTPException(status_code=500, detail=f"Could not publish the decoded result: {_first_line(e)}")
+        finally:
+            cur.close(); conn.close()
+    log.info("CPI decode published and ledgered: %s", req.event_id)
+    return {"status": "ok", "label": res["label"]}
+
+class CPILogReq(BaseModel):
+    pair: str
+    outcome: str
+    net_pips: Optional[float] = None
+    release_utc: Optional[str] = None
+    release_date: Optional[str] = None
+    inputs: Optional[CPIDecodeV2Req] = None
+
+@app.post("/api/admin/cpi-ledger/log")
+def cpi_ledger_log(req: CPILogReq, admin: str = Depends(require_admin)):
+    pair = req.pair.strip().upper().replace("/", "")
+    code_to_pair = {v: k for k, v in PAIR_CODES.items()}
+    if pair not in code_to_pair:
+        raise HTTPException(status_code=422, detail="'pair' must be EUR/USD, EUR/GBP or EUR/JPY.")
+    outcome = req.outcome.strip().upper()
+    if outcome not in CPI_OUTCOMES:
+        raise HTTPException(status_code=422, detail="'outcome' must be WIN, LOSS, TIME_EXIT or SKIPPED.")
+    net = req.net_pips
+    if outcome == "SKIPPED":
+        net = 0.0
+    elif net is not None:
+        net = _num(net, -1000, 1000, "net_pips")
+    with _EVENTS_LOCK, _CPI_LOCK:
+        conn = get_db_conn(); cur = conn.cursor()
+        try:
+            ph = ph_for(conn)
+            ledger = _setting_get(cur, ph, CPI_LEDGER_KEY) or {}
+            events = _read_events(cur, ph)
+            if req.release_date:
+                date = req.release_date.strip()
+                if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+                    raise HTTPException(status_code=422, detail="'release_date' must look like 2026-12-01.")
+                release_utc = date + "T00:00:00Z"
+            else:
+                release_utc = _release_for(events, "EUR_CPI", req.release_utc)
+            if req.inputs is not None:
+                check_numbers(req.inputs)
+                cfg = _load_cfg(cur, ph)
+                proxy = _norm_proxy(req.inputs.proxy_signal or ((events.get("EUR_CPI") or {}).get("result") or {}).get("signal"))
+                res = _cpi_decode_v2(req.inputs, proxy, cfg)
+                _merge_ledger(ledger, _ledger_rows(res, release_utc, cfg, _utc_iso()))
+            rid = f"{release_utc[:10]}|{pair}"
+            row = ledger.get(rid)
+            if not row:
+                raise HTTPException(status_code=404, detail="No ledger row for that release and pair. Decode the release first.")
+            if net is None:  # no pips typed: use the planned outcome so the pip totals stay meaningful
+                stop = row.get("stop_pips") or 0
+                net = {"WIN": round(stop * (row.get("target_r") or 0), 1), "LOSS": -float(stop)}.get(outcome, 0.0)
+            row["outcome"], row["net_pips"] = outcome, net
+            row["r_multiple"] = _calc_r(row)
+            row["manual"], row["logged_at"] = True, _utc_iso()
+            _setting_set(conn, cur, CPI_LEDGER_KEY, ledger, CPI_LEDGER_MAX_CHARS)
+            conn.commit()
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback(); log.exception("Ledger log failed")
+            raise HTTPException(status_code=500, detail=f"Could not save the log: {_first_line(e)}")
+        finally:
+            cur.close(); conn.close()
+    return {"status": "ok", "id": rid, "outcome": outcome, "net_pips": net, "r_multiple": row["r_multiple"]}
+
+def _read_ledger_rows():
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        ledger = _setting_get(cur, ph_for(conn), CPI_LEDGER_KEY) or {}
+    finally:
+        cur.close(); conn.close()
+    return sorted(ledger.values(), key=lambda r: (r.get("release_date", ""), r.get("pair", "")), reverse=True)
+
+@app.get("/api/admin/cpi-ledger")
+def cpi_ledger(response: Response, admin: str = Depends(require_admin)):
+    response.headers["Cache-Control"] = "no-store"
+    rows = _read_ledger_rows()
+    return {"rows": rows[:200], "total_rows": len(rows), "stats": _ledger_stats(rows)}
+
+CSV_COLUMNS = ["release_date", "release_utc", "pair", "proxy_signal", "classification", "label", "ecb_score",
+               "h_surp", "c_surp", "s_surp", "services_basis", "spike_1m_pips", "reclaimed", "uk_news", "risk_off",
+               "plan_status", "outcome", "net_pips", "r_multiple", "stop_pips", "target_r", "decoded_at", "logged_at", "config_json"]
+
+def _csv_cell(v):
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@"):
+        return "'" + v   # stops spreadsheet formula injection in text cells
+    return "" if v is None else v
+
+@app.get("/api/admin/cpi-ledger.csv")
+def cpi_ledger_csv(admin: str = Depends(require_admin)):
+    rows = list(reversed(_read_ledger_rows()))
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(CSV_COLUMNS)
+    for r in rows:
+        line = []
+        for col in CSV_COLUMNS:
+            line.append(json.dumps(r.get("config"), separators=(",", ":")) if col == "config_json" else _csv_cell(r.get(col)))
+        w.writerow(line)
+    return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="cpi_decoder_ledger.csv"', "Cache-Control": "no-store"})
+
+# ---------------------------------------------------------------------------
+# Release Ledger (all news): was each release a HIT, MISS or TRAP versus our projection?
+# One row per release date + event, stored in site_settings. Rows are created when the projection
+# is released and completed when the decoder result is sent to clients.
+# ---------------------------------------------------------------------------
+REL_LEDGER_KEY = "release_ledger"
+REL_LEDGER_MAX_ROWS = 3000
+REL_LEDGER_MAX_CHARS = 3_000_000
+REL_RESULTS = ("HIT", "MISS", "TRAP", "INLINE", "NO CALL")
+BULL_WORDS = ("USD BULLISH", "USD SURGE", "HAWKISH BREAKOUT", "GBP BULLISH", "EUR BULLISH", "BULLISH EUR")
+BEAR_WORDS = ("USD BEARISH", "USD DROP", "DOVISH RALLY", "GBP BEARISH", "EUR BEARISH", "BEARISH EUR")
+
+def _projected_dir(result):
+    bias = str((result or {}).get("bias", "")).upper()
+    if bias in ("HOTTER", "HAWKISH", "BULLISH"):
+        return "BULLISH"
+    if bias in ("COOLER", "DOVISH", "BEARISH"):
+        return "BEARISH"
+    return "NONE"
+
+def _actual_dir(verdict):
+    v = str(verdict or "").upper()
+    if v.startswith("STAND ASIDE"):
+        return "NEUTRAL"
+    if "TRAP" in v:
+        return "TRAP"
+    bull = any(w in v for w in BULL_WORDS)
+    bear = any(w in v for w in BEAR_WORDS)
+    if bull and not bear:
+        return "BULLISH"
+    if bear and not bull:
+        return "BEARISH"
+    return "NEUTRAL"
+
+def _call_result(projected, actual):
+    if actual is None:
+        return "PENDING"
+    if actual == "TRAP":
+        return "TRAP"
+    if projected == "NONE":
+        return "NO CALL"
+    if actual == "NEUTRAL":
+        return "INLINE"
+    return "HIT" if projected == actual else "MISS"
+
+def _release_touch(conn, cur, ev, verdict=None, ts=None):
+    """Create or update the ledger row for this release. The caller holds the locks and commits."""
+    ph = ph_for(conn)
+    ledger = _setting_get(cur, ph, REL_LEDGER_KEY) or {}
+    date = str(ev.get("release_utc", ""))[:10]
+    rid = f"{date}|{ev.get('event_id')}"
+    res = ev.get("result") or {}
+    row = ledger.get(rid)
+    if row is None:
+        row = {"id": rid, "release_date": date, "release_utc": ev.get("release_utc"), "event_id": ev.get("event_id"),
+               "currency": ev.get("currency"), "module": ev.get("module"), "title": ev.get("title"),
+               "decoder_verdict": None, "actual": None, "result": "PENDING", "manual": False,
+               "projected_at": None, "decoded_at": None}
+    if ev.get("released") or row.get("projected") is None:
+        row["projected"] = _projected_dir(res)
+        row["projection_label"] = str(res.get("signal") or res.get("verdict") or res.get("bias") or "")[:120]
+        row["projection_score"] = res.get("score")
+        row["projection_summary"] = str(res.get("summary") or "")[:300]
+        row["projected_at"] = ev.get("updated_at") or _utc_iso()
+    if verdict is not None:
+        row["decoder_verdict"] = str(verdict)[:300]
+        row["actual"] = _actual_dir(verdict)
+        row["decoded_at"] = ts or _utc_iso()
+    if not row.get("manual"):
+        row["result"] = _call_result(row.get("projected", "NONE"), row.get("actual"))
+    ledger[rid] = row
+    if len(ledger) > REL_LEDGER_MAX_ROWS:
+        for k in sorted(ledger, key=lambda x: ledger[x].get("release_date", ""))[: len(ledger) - REL_LEDGER_MAX_ROWS]:
+            del ledger[k]
+    _setting_set(conn, cur, REL_LEDGER_KEY, ledger, REL_LEDGER_MAX_CHARS)
+
+def _release_stats(rows):
+    def blank():
+        return {"releases": 0, "HIT": 0, "MISS": 0, "TRAP": 0, "INLINE": 0, "NO CALL": 0, "PENDING": 0, "hit_rate": None}
+    out = {"ALL": blank()}
+    for r in rows:
+        key = f"{r.get('currency')}_{r.get('module')}"
+        for k in (key, "ALL"):
+            b = out.setdefault(k, blank())
+            b["releases"] += 1
+            b[r.get("result", "PENDING")] = b.get(r.get("result", "PENDING"), 0) + 1
+    for b in out.values():
+        scored = b["HIT"] + b["MISS"]
+        b["hit_rate"] = round(b["HIT"] / scored * 100, 1) if scored else None
+    return out
+
+def _read_release_rows():
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        ledger = _setting_get(cur, ph_for(conn), REL_LEDGER_KEY) or {}
+    finally:
+        cur.close(); conn.close()
+    return sorted(ledger.values(), key=lambda r: (r.get("release_date", ""), r.get("event_id", "")), reverse=True)
+
+@app.get("/api/admin/release-ledger")
+def release_ledger(response: Response, admin: str = Depends(require_admin)):
+    response.headers["Cache-Control"] = "no-store"
+    rows = _read_release_rows()
+    return {"rows": rows[:300], "total_rows": len(rows), "stats": _release_stats(rows)}
+
+class ReleaseOverrideReq(BaseModel):
+    id: str
+    result: str
+
+@app.post("/api/admin/release-ledger/override")
+def release_ledger_override(req: ReleaseOverrideReq, admin: str = Depends(require_admin)):
+    result = req.result.strip().upper()
+    if result not in REL_RESULTS:
+        raise HTTPException(status_code=422, detail="'result' must be HIT, MISS, TRAP, INLINE or NO CALL.")
+    with _CPI_LOCK:
+        conn = get_db_conn(); cur = conn.cursor()
+        try:
+            ph = ph_for(conn)
+            ledger = _setting_get(cur, ph, REL_LEDGER_KEY) or {}
+            row = ledger.get(req.id)
+            if not row:
+                raise HTTPException(status_code=404, detail="That release is not in the ledger.")
+            row["result"], row["manual"] = result, True
+            _setting_set(conn, cur, REL_LEDGER_KEY, ledger, REL_LEDGER_MAX_CHARS)
+            conn.commit()
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback(); log.exception("Ledger override failed")
+            raise HTTPException(status_code=500, detail=f"Could not save the change: {_first_line(e)}")
+        finally:
+            cur.close(); conn.close()
+    return {"status": "ok", "id": req.id, "result": result}
+
+REL_CSV_COLUMNS = ["release_date", "release_utc", "event_id", "currency", "module", "title", "projected",
+                   "projection_label", "projection_score", "decoder_verdict", "actual", "result", "manual",
+                   "projected_at", "decoded_at"]
+
+@app.get("/api/admin/release-ledger.csv")
+def release_ledger_csv(admin: str = Depends(require_admin)):
+    rows = list(reversed(_read_release_rows()))
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(REL_CSV_COLUMNS)
+    for r in rows:
+        w.writerow([_csv_cell(r.get(c)) for c in REL_CSV_COLUMNS])
+    return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="release_ledger.csv"', "Cache-Control": "no-store"})
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """<!DOCTYPE html>
@@ -1966,6 +2646,9 @@ def index():
   .pill.up { color: var(--gold-bright); border-color: var(--gold); }
   .pill.live { color: #fff; background: #7f1d1d; border-color: var(--red); }
   .pill.done { color: var(--muted); }
+  .pill.hit { color: #34d399; border-color: #34d399; }
+  .pill.miss { color: #fff; background: #7f1d1d; border-color: var(--red); }
+  .pill.trap { color: #fbbf24; border-color: #fbbf24; }
   .sched-box { border-color: var(--gold); }
   .sched-box input[type="datetime-local"] { width: 100%; background: #04140f; border: 1px solid var(--border); color: #fff; padding: 0.5rem; border-radius: 6px; font-size: 0.9rem; color-scheme: dark; }
   #clientQueue { display: none; }
@@ -3038,12 +3721,12 @@ def index():
         ["italy_hicp", "Italy HICP (%) * [16.8%]", 1.9, 0.01],
         ["spain_hicp", "Spain HICP (%) * [11.1%]", 2.5, 0.01],
         ["netherlands_hicp", "Netherlands HICP (%) [5.7%] — optional, leave blank if not released", "", 0.01, true],
-        ["belgium_hicp", "Belgium HICP (%) [3.8%] — optional, leave blank if not released", "", 0.01, true]
+        ["belgium_hicp", "Belgium HICP (%) [3.8%] — optional, leave blank if not released", "", 0.01, true],
+        ["hcob_srv_prices", "Lead: HCOB Flash Services Output Prices (this month)", 55.2, 0.1],
+        ["hcob_srv_prices_prev", "Lead: HCOB Services Output Prices (previous month)", 54.0, 0.1],
+        ["ttf_gas_brent_pct", "Lead: TTF Gas / Brent Monthly % Δ (⚡ Auto-Fetch fills this)", 4.0, 0.1]
       ],
-      selectsAfter: [["lead_indicator", "Lead Indicator Adjustment", [
-        ["BULLISH", "Bullish (+0.05%) — Flash Services Output Prices & TTF Gas both up"],
-        ["NEUTRAL", "Neutral (0.00%) — Mixed / Flat"],
-        ["BEARISH", "Bearish (-0.05%) — Flash Services Output Prices & TTF Gas both down"]], "NEUTRAL"]],
+      note: "Lead adjustment is automatic: services prices and gas both up = +0.05%, both down = -0.05%, mixed = 0.00%.",
       checks: [],
       extraHtml: `<div style="margin-top:0.9rem; padding:0.75rem; border:1px solid var(--border); border-radius:8px; background:#04140f;">
         <label style="color:var(--gold-bright);">Germany HICP — 4-State Calculator</label>
@@ -3175,7 +3858,7 @@ def index():
         </div>
         <div class="card">
           <h2>⚡ 3. Post-Release Action Decoder</h2>
-          ${decoderFormHtml(key, "dec_" + p, null)}
+          ${key === "EUR_CPI" ? cpiDecoderV2Html() : decoderFormHtml(key, "dec_" + p, null)}
         </div>
       </div>
     </div>`;
@@ -3212,7 +3895,7 @@ def index():
     if (d.inputs.BE !== null && d.inputs.BE !== undefined) inp += ` | BE: ${d.inputs.BE}%`;
     const tags = (d.reasons || []).map(r => `<span class="pill up" style="margin-right:0.35rem;">${esc(r)}</span>`).join("");
     return `<div style="font-weight:700; margin-bottom:0.35rem;">Proxy: ${d.proxy_rounded.toFixed(1)}% (${d.predicted_cpi.toFixed(2)}%) vs. Consensus: ${esc(d.consensus)}% | Edge: ${sgn}${d.surprise_delta.toFixed(2)}%</div>
-      <div style="font-size:0.85rem; color:#d1d5db; margin-bottom:0.35rem;">${esc(inp)}</div>
+      <div style="font-size:0.85rem; color:#d1d5db; margin-bottom:0.35rem;">${esc(inp)}${d.lead_label ? esc("  |  Lead: " + d.lead_label) : ""}</div>
       ${tags ? `<div style="margin-bottom:0.35rem;">${tags}</div>` : ""}
       <div style="font-size:0.88rem; color:#d1d5db;">${esc(d.note || d.summary || "")}</div>`;
   }
@@ -3229,6 +3912,8 @@ def index():
       document.getElementById(p + "Score").innerText = `Edge: ${d.surprise_delta >= 0 ? "+" : ""}${d.surprise_delta.toFixed(2)}%`;
       document.getElementById(p + "Summary").innerHTML = eurCpiLines(d);
       document.getElementById(p + "Pairs").innerHTML = pairRows(d.pairs);
+      const px = document.getElementById("cd2_proxy");
+      if (px) px.value = d.signal.indexOf("DO NOT TRADE") === 0 ? "DO NOT TRADE" : d.signal;
       return;
     }
     const up = d.bias === "HOTTER", down = d.bias === "COOLER";
@@ -3329,7 +4014,8 @@ def index():
       });
       if (!pub.ok) { status.innerText = "Publish failed: " + errText(pub.data); return; }
       const warn = pub.data.storage && !pub.data.storage.includes("Permanent") ? " WARNING: saved only to temporary storage (" + pub.data.storage + ")." : "";
-      status.innerText = (released ? `✅ Projection released to clients.` : `✅ Countdown scheduled for ${when.toLocaleString()}.`) + warn;
+      status.innerText = (released ? `✅ Projection released to clients and added to the release ledger.` : `✅ Countdown scheduled for ${when.toLocaleString()}.`) + warn;
+      loadRelLedger();
       loadQueue();
     } catch (e) {
       status.innerText = "Publish failed. Check your connection and try again.";
@@ -3339,6 +4025,7 @@ def index():
   const DECODE_OUT_ID = { USD_NFP: "nfpDecodeOut", USD_CPI: "cpiDecodeOut", USD_PPI: "ppiDecodeOut", USD_FOMC: "fomcDecodeOut" };
 
   async function publishDecode(key) {
+    if (key === "EUR_CPI") { publishCpiDecode(); return; }
     const status = document.getElementById("pubst_" + key);
     const out = document.getElementById(DECODE_OUT_ID[key] || ("dec_" + MODS[key].prefix + "_out"));
     const verdict = out && out.children[0] ? out.children[0].innerText.trim() : "";
@@ -3346,7 +4033,8 @@ def index():
     if (!verdict || out.classList.contains("hidden")) { status.innerText = "Run the decoder for this module first (Step 3 box below), then send it."; return; }
     if (!confirm(`Send this decoded result to clients?\n\n${verdict}`)) return;
     const pub = await apiPost("/api/admin/publish-decode", { event_id: key, verdict: verdict, plan: plan });
-    status.innerText = pub.ok ? "✅ Decoded result sent to clients." : "Could not send: " + errText(pub.data);
+    status.innerText = pub.ok ? "✅ Decoded result sent to clients and the release ledger updated." : "Could not send: " + errText(pub.data);
+    if (pub.ok) loadRelLedger();
   }
 
   // ---- admin queue manager ----
@@ -3437,6 +4125,11 @@ def index():
   function decodedHtml(ev) {
     const d = ev.decoded;
     if (!d) return "";
+    if (d.details) {
+      return `<div class="decoder-box" style="margin-top:1.1rem; border-width:2px; text-align:left;">
+        <div class="desk-badge" style="margin-bottom:0.2rem;">⚡ A&amp;M Research Desk — Post-Release Decode (Updated: ${esc(fmtTime(d.updated_at))})</div>
+        ${cpiPlanHtml(d.details, false, ev.event_id)}</div>`;
+    }
     return `<div class="decoder-box" style="margin-top:1.1rem; border-width:2px; text-align:left;">
       <div class="desk-badge" style="margin-bottom:0.6rem;">⚡ A&amp;M Research Desk — Post-Release Decode (Updated: ${esc(fmtTime(d.updated_at))})</div>
       <div style="color:var(--gold-bright); font-weight:800; margin-bottom:0.3rem;">${esc(d.verdict)}</div>
@@ -3597,7 +4290,8 @@ def index():
       ["Spain HICP flash [11.1%]", "Same morning, about 11:00", "FF"],
       ["Netherlands HICP [5.7%], optional", "Same morning if published, else leave blank", "FF"],
       ["Belgium HICP [3.8%], optional", "Same morning if published, else leave blank", "FF"],
-      ["Lead indicator: Flash Services Output Prices and TTF Gas (±0.05%)", "Flash PMI ~3rd/4th week 12:00; TTF daily", "PMI"]
+      ["HCOB Flash Services Output Prices, this and previous month (lead ±0.05%)", "Flash PMI ~3rd/4th week 12:00", "PMI"],
+      ["TTF Gas / Brent monthly % Δ (lead ±0.05%)", "Daily, use ⚡ Auto-Fetch", null]
     ] },
     { key: "EUR_PMI", cur: "EUR", main: "HCOB Flash, 12:00 EAT (Germany 11:30, France 11:15)", rows: [
       ["German Flash PMI [40%]", "Flash day ~3rd/4th week, 11:30", "PMI"],
@@ -3632,6 +4326,310 @@ def index():
     </details>`;
   }
 
+
+  // ==========================================================================
+  // EUR CPI Post-Release Decoder v2 (admin form + client plan card) and the admin ledger / calibration panel
+  // ==========================================================================
+  const UNVERIFIED_BADGE = "⚠️ Unverified Edge — Log live trades to validate thresholds before scaling size.";
+  const PAIR_LIST = ["EUR/USD", "EUR/GBP", "EUR/JPY"];
+  const PAIR_CODE = { "EUR/USD": "EURUSD", "EUR/GBP": "EURGBP", "EUR/JPY": "EURJPY" };
+  const fmtS = v => (v === null || v === undefined) ? "n/a" : ((v >= 0 ? "+" : "") + Number(v).toFixed(2));
+
+  function cpiDecoderV2Html() {
+    const chk = (id, label) => `<div class="check-row"><input type="checkbox" id="cd2_${id}" /><label for="cd2_${id}" style="margin:0; color:var(--text); cursor:pointer;">${label}</label></div>`;
+    const num = (id, label, val, step) => `<div><label>${label}</label><input type="number" id="cd2_${id}" value="${val}" step="${step}" /></div>`;
+    return `<div class="form-grid">
+        <div><label>Pre-Release Proxy v3 Signal (auto-filled from the calculator above)</label>
+          <select id="cd2_proxy"><option value="STRONG BUY EUR">STRONG BUY EUR</option><option value="STRONG SELL EUR">STRONG SELL EUR</option><option value="DO NOT TRADE" selected>DO NOT TRADE</option></select></div>
+        ${num("balance", "Account Balance ($) — for your lot sizes only, never shown to clients", 10000, 100)}
+        ${num("hf", "Headline Forecast (%)", 2.1, 0.1)}${num("ha", "Headline Actual (%)", 2.2, 0.1)}
+        ${num("cf", "Core Forecast (%)", 2.3, 0.1)}${num("ca", "Core Actual (%)", 2.5, 0.1)}
+        <div><label>Services HICP Benchmark Type</label>
+          <select id="cd2_sbasis"><option value="FORECAST">Actual vs Forecast</option><option value="PRIOR">Actual vs Prior</option><option value="NONE">Not available (ignore services)</option></select></div>
+        ${num("sb", "Services Benchmark (%)", 3.9, 0.1)}${num("sa", "Services Actual (%)", 4.1, 0.1)}
+        ${num("spike", "EUR/USD 1-min check: 11:01 close minus 10:59 close (pips)", 0, 0.1)}
+        ${chk("reclaim", "11:01 candle has reclaimed (or broken back through) the 10:59 CET price")}
+        ${chk("uk", "UK High-Impact News Today (skips EUR/GBP)")}
+        ${chk("risk", "Risk-Off Equity Drop (DAX below -0.5%) (skips EUR/JPY buys)")}
+      </div>
+      <button class="btn-outline" style="width:100%; margin-top:0.85rem;" onclick="runCpiDecode()">Decode Actual Print &amp; Get Trade Plan (Decoder v2)</button>
+      <div id="cd2_out" class="hidden"></div>`;
+  }
+
+  function gatherCpiInputs() {
+    const v = id => Number(document.getElementById("cd2_" + id).value);
+    return {
+      proxy_signal: document.getElementById("cd2_proxy").value,
+      account_balance: v("balance"),
+      headline_forecast: v("hf"), headline_actual: v("ha"),
+      core_forecast: v("cf"), core_actual: v("ca"),
+      services_basis: document.getElementById("cd2_sbasis").value,
+      services_benchmark: v("sb"), services_actual: v("sa"),
+      spike_1m_pips: v("spike"),
+      reclaimed: document.getElementById("cd2_reclaim").checked,
+      uk_news: document.getElementById("cd2_uk").checked,
+      risk_off: document.getElementById("cd2_risk").checked
+    };
+  }
+
+  function cpiPlanHtml(d, admin, eid) {
+    const cls = d.direction === "BUY" ? "bull" : d.direction === "SELL" ? "bear" : "neut";
+    const surp = `Surprises: Headline ${fmtS(d.h_surp)}% | Core ${fmtS(d.c_surp)}% | Services ${fmtS(d.s_surp)}%`;
+    const tradable = PAIR_LIST.filter(p => d.pairs && d.pairs[p] && d.pairs[p].status === "TRADE");
+    const calc = (!admin && tradable.length) ? `<div style="margin:0.7rem 0;"><label>Your account balance ($) — lot sizes at ${esc(d.risk_pct)}% risk (calculated on your device, never stored)</label>
+        <input type="number" id="cc_bal_${eid}" placeholder="e.g. 5000" oninput="clientLots('${eid}')" /></div>` : "";
+    const rows = PAIR_LIST.filter(p => d.pairs && d.pairs[p]).map(p => {
+      const pl = d.pairs[p];
+      const lot = admin ? (pl.lot !== undefined ? `<div style="color:var(--gold-bright); font-weight:700; margin-top:0.25rem;">Your lot size at ${esc(d.risk_pct)}% risk: ${Number(pl.lot).toFixed(2)}</div>` : "")
+        : (pl.status === "TRADE" ? `<div class="cpi-lot" id="lot_${eid}_${PAIR_CODE[p]}" data-stop="${pl.stop}" data-pip="${pl.pip_value}" style="color:var(--gold-bright); font-weight:700; margin-top:0.25rem;"></div>` : "");
+      return `<div style="border-top:1px solid var(--border); padding:0.6rem 0;"><span class="pill ${pl.status === "TRADE" ? "up" : "done"}">${pl.status}</span> <span style="font-size:0.88rem;">${esc(pl.text)}</span>${lot}</div>`;
+    }).join("");
+    return `<div data-risk="${esc(d.risk_pct)}" id="cpiplan_${eid}">
+      <div class="verdict-box" style="margin-top:0.9rem;">
+        <span class="big-score ${cls}">${esc(d.label)}</span>
+        <p style="font-size:0.88rem; color:#d1d5db; margin-top:0.5rem;">${esc(d.summary)}</p>
+        ${d.close_note ? `<p style="font-size:0.88rem; color:var(--red); font-weight:700; margin-top:0.4rem;">${esc(d.close_note)}</p>` : ""}
+        <p style="font-size:0.78rem; color:var(--muted); margin-top:0.4rem;">${esc(surp)}${admin ? esc(` | ECB score: ${fmtS(d.ecb_score)} (min ${d.min_threshold})`) : ""}</p>
+      </div>
+      ${calc}${rows}
+      <p style="font-size:0.75rem; color:var(--muted); margin-top:0.6rem;">${UNVERIFIED_BADGE}</p>
+    </div>`;
+  }
+
+  function clientLots(eid) {
+    const bal = Number(document.getElementById("cc_bal_" + eid).value);
+    const risk = Number(document.getElementById("cpiplan_" + eid).dataset.risk);
+    document.querySelectorAll("#cpiplan_" + eid + " .cpi-lot").forEach(el => {
+      if (!(bal > 0)) { el.innerText = ""; return; }
+      const lot = Math.floor(((bal * risk / 100) / (Number(el.dataset.stop) * Number(el.dataset.pip))) * 100) / 100;
+      el.innerText = `Lot size at ${risk}% risk: ${lot.toFixed(2)}`;
+    });
+  }
+
+  let cpiOutcome = null;
+  async function runCpiDecode() {
+    if (!(currentUser && currentUser.is_admin)) return;
+    const out = document.getElementById("cd2_out");
+    out.classList.remove("hidden");
+    out.innerHTML = `<p style="color:var(--muted); margin-top:0.8rem;">Decoding...</p>`;
+    const { ok, data } = await apiPost("/api/admin/cpi-decode", gatherCpiInputs());
+    if (!ok) { out.innerHTML = `<p style="color:var(--red); margin-top:0.8rem;">${esc(errText(data))}</p>`; return; }
+    cpiOutcome = null;
+    out.innerHTML = cpiPlanHtml(data, true, "admin") + cpiLogBarHtml(data);
+  }
+
+  // ---- admin-only quick-log bar (only ever built inside the admin decoder) ----
+  function cpiLogBarHtml(d) {
+    if (!(currentUser && currentUser.is_admin)) return "";
+    const btn = (o, label) => `<button class="btn-outline cpi-out-btn" data-out="${o}" onclick="pickCpiOutcome('${o}')">${label}</button>`;
+    return `<div class="desk-only" id="cd2_log" style="margin-top:1rem; padding:0.8rem; border:1px dashed var(--gold); border-radius:8px;">
+      <label style="color:var(--gold-bright);">📒 Admin Quick-Log (saved to the ledger)</label>
+      <div class="form-grid" style="margin-bottom:0.6rem;">
+        <div><label>Pair</label><select id="cd2_lpair">${PAIR_LIST.map(p => `<option>${p}</option>`).join("")}</select></div>
+        <div><label>Actual Net Pips (e.g. +21.6 or -12.0; leave blank to use the planned result)</label><input type="number" id="cd2_lpips" step="0.1" /></div>
+      </div>
+      <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:0.6rem;">
+        ${btn("WIN", "✅ WIN (+1.8R)")}${btn("LOSS", "❌ LOSS (-1.0R)")}${btn("TIME_EXIT", "⏱️ TIME EXIT (Flat/Partial)")}${btn("SKIPPED", "⏭️ SKIPPED")}
+      </div>
+      <button class="btn" style="width:100%;" onclick="saveCpiLog()">💾 Save to Database</button>
+      <p id="cd2_logmsg" style="font-size:0.8rem; margin-top:0.4rem; color:var(--gold);"></p>
+    </div>`;
+  }
+
+  function pickCpiOutcome(o) {
+    cpiOutcome = o;
+    document.querySelectorAll(".cpi-out-btn").forEach(b => { b.style.borderColor = b.dataset.out === o ? "var(--gold-bright)" : ""; b.style.color = b.dataset.out === o ? "var(--gold-bright)" : ""; });
+  }
+
+  async function saveCpiLog() {
+    if (!(currentUser && currentUser.is_admin)) return;
+    const msg = document.getElementById("cd2_logmsg");
+    if (!cpiOutcome) { msg.innerText = "Pick an outcome first."; return; }
+    const pipsRaw = document.getElementById("cd2_lpips").value;
+    const rel = document.getElementById("rel_EUR_CPI") ? document.getElementById("rel_EUR_CPI").value : "";
+    const body = { pair: document.getElementById("cd2_lpair").value, outcome: cpiOutcome, inputs: gatherCpiInputs() };
+    if (String(pipsRaw).trim() !== "") body.net_pips = Number(pipsRaw);
+    if (rel && !isNaN(new Date(rel).getTime())) body.release_utc = new Date(rel).toISOString().slice(0, 19) + "Z";
+    const { ok, data } = await apiPost("/api/admin/cpi-ledger/log", body);
+    msg.innerText = ok ? `✅ Saved ${body.pair}: ${data.outcome}${data.r_multiple !== null ? " (" + data.r_multiple + "R)" : ""}` : "Could not save: " + errText(data);
+    if (ok) loadCalibration();
+  }
+
+  async function publishCpiDecode() {
+    const status = document.getElementById("pubst_EUR_CPI");
+    if (!confirm("Send the Decoder v2 result to clients and add this release to the ledger?")) return;
+    const { ok, data } = await apiPost("/api/admin/publish-cpi-decode", { event_id: "EUR_CPI", inputs: gatherCpiInputs() });
+    status.innerText = ok ? `✅ Sent to clients: ${data.label}. Release added to the ledgers.` : "Could not send: " + errText(data);
+    if (ok) { loadCalibration(); loadRelLedger(); }
+  }
+
+  // ---- admin calibration & reality-check dashboard ----
+  function calibrationHtml() {
+    const cfgIn = (id, label, step) => `<div><label>${label}</label><input type="number" id="cfg_${id}" step="${step}" /></div>`;
+    return `<details class="card desk-only" id="calCard" style="border-color: var(--gold);" ontoggle="if (this.open) loadCalibration()">
+      <summary style="cursor:pointer; font-weight:800; color:var(--gold-bright);">📊 CPI Decoder Empirical Validation (Admin Only)</summary>
+      <div style="overflow-x:auto; margin-top:0.9rem;"><table>
+        <thead><tr><th>Signal Type</th><th>Sample (N)</th><th>Win Rate</th><th>Net Pips</th><th>Avg R</th></tr></thead>
+        <tbody id="calStats"><tr><td colspan="5" style="color:var(--muted);">Loading...</td></tr></tbody>
+      </table></div>
+      <div id="calWarn"></div>
+      <p id="calTotals" style="font-size:0.8rem; color:var(--muted); margin:0.6rem 0;"></p>
+      <h2 style="margin-top:1rem;"><span>🎚️ Live Threshold Sandbox</span></h2>
+      <div class="form-grid">
+        ${cfgIn("deadzoneThreshold", "Deadzone Threshold", 0.01)}${cfgIn("standardThreshold", "Standard Threshold", 0.01)}${cfgIn("coldEntryThreshold", "Cold-Entry Threshold", 0.01)}
+        ${cfgIn("w_services", "Weight: Services", 0.05)}${cfgIn("w_core", "Weight: Core", 0.05)}${cfgIn("w_headline", "Weight: Headline", 0.05)}
+        ${cfgIn("pip_EURUSD", "Pip value per lot: EUR/USD ($)", 0.1)}${cfgIn("pip_EURGBP", "Pip value per lot: EUR/GBP ($)", 0.1)}${cfgIn("pip_EURJPY", "Pip value per lot: EUR/JPY ($)", 0.1)}
+      </div>
+      <p style="font-size:0.78rem; color:var(--muted); margin-top:0.5rem;">Weights must add up to 1.00. Saved values apply to every future decode and are stamped on each ledger row. Pip values only hold near current exchange rates.</p>
+      <div style="display:flex; gap:0.6rem; flex-wrap:wrap; margin-top:0.6rem;">
+        <button class="btn" onclick="saveCpiConfig()">💾 Save Calibration</button>
+        <a class="btn-outline" href="/api/admin/cpi-ledger.csv" style="text-decoration:none; display:inline-block; padding:0.55rem 1rem; border-radius:6px;">⬇️ Export CSV</a>
+        <button class="btn-outline" onclick="loadCalibration()">🔄 Refresh</button>
+      </div>
+      <p id="cfgMsg" style="font-size:0.8rem; margin-top:0.4rem; color:var(--gold);"></p>
+      <h2 style="margin-top:1rem;"><span>📒 Release Ledger (every decoded release)</span></h2>
+      <div style="overflow-x:auto;"><table>
+        <thead><tr><th>Date</th><th>Pair</th><th>Signal</th><th>Outcome</th><th>Net Pips</th><th>R</th><th>Update</th></tr></thead>
+        <tbody id="calLedger"></tbody>
+      </table></div>
+    </details>`;
+  }
+
+  async function loadCalibration() {
+    const statsBody = document.getElementById("calStats");
+    if (!statsBody) return;
+    try {
+      const [lres, cres] = await Promise.all([fetch("/api/admin/cpi-ledger", { cache: "no-store" }), fetch("/api/admin/cpi-config", { cache: "no-store" })]);
+      if (!lres.ok || !cres.ok) throw new Error("bad response");
+      const led = await lres.json();
+      const cfg = (await cres.json()).config;
+      const bc = led.stats.by_class;
+      statsBody.innerHTML = ["CLEAN BEAT", "CLEAN MISS", "CONFIRMED TRAP"].map(k => {
+        const r = bc[k];
+        return `<tr style="${r.warning ? "background:#3b0d0d;" : ""}"><td><strong>${k}</strong></td><td>${r.n}</td><td>${r.win_rate === null ? "—" : r.win_rate + "%"}</td><td>${r.net_pips}</td><td>${r.avg_r === null ? "—" : r.avg_r}</td></tr>`;
+      }).join("");
+      document.getElementById("calWarn").innerHTML = bc["CONFIRMED TRAP"].warning
+        ? `<p style="color:#fff; background:#7f1d1d; border:1px solid var(--red); border-radius:6px; padding:0.6rem; margin-top:0.6rem; font-weight:700;">⚠️ Trap assumption failing — consider switching divergence rule to STAND ASIDE.</p>` : "";
+      const st = led.stats;
+      document.getElementById("calTotals").innerText = `Releases decoded: ${st.releases} | Awaiting your outcome: ${st.pending} | Skipped: ${st.skipped} | No signal: ${st.no_signal} | Rows stored: ${led.total_rows}`;
+      document.getElementById("cfg_deadzoneThreshold").value = cfg.deadzoneThreshold;
+      document.getElementById("cfg_standardThreshold").value = cfg.standardThreshold;
+      document.getElementById("cfg_coldEntryThreshold").value = cfg.coldEntryThreshold;
+      document.getElementById("cfg_w_services").value = cfg.weights.services;
+      document.getElementById("cfg_w_core").value = cfg.weights.core;
+      document.getElementById("cfg_w_headline").value = cfg.weights.headline;
+      Object.keys(cfg.pairs).forEach(c => { document.getElementById("cfg_pip_" + c).value = cfg.pairs[c].pipValuePerLot; });
+      document.getElementById("calLedger").innerHTML = led.rows.length ? led.rows.map(r => {
+        const rid = r.release_date + "_" + PAIR_CODE[r.pair];
+        const sel = ["WIN", "LOSS", "TIME_EXIT", "SKIPPED"].map(o => `<option value="${o}"${r.outcome === o ? " selected" : ""}>${o}</option>`).join("");
+        const editable = r.classification !== "STAND ASIDE";
+        return `<tr><td>${esc(r.release_date)}</td><td>${esc(r.pair)}</td><td>${esc(r.classification)}</td><td><span class="pill ${r.outcome === "PENDING" ? "up" : "done"}">${esc(r.outcome)}</span></td>
+          <td>${r.net_pips === null ? "—" : r.net_pips}</td><td>${r.r_multiple === null ? "—" : r.r_multiple}</td>
+          <td>${editable ? `<select id="lr_o_${rid}">${sel}</select> <input type="number" id="lr_p_${rid}" step="0.1" placeholder="pips" style="width:5rem;" /> <button class="btn-outline" onclick="logRow('${r.release_date}', '${PAIR_CODE[r.pair]}')">Save</button>` : "—"}</td></tr>`;
+      }).join("") : `<tr><td colspan="7" style="color:var(--muted);">No releases decoded yet. Press "Send Decoded Result to Clients" on the EUR CPI tab and each release is added here automatically.</td></tr>`;
+    } catch (e) {
+      statsBody.innerHTML = `<tr><td colspan="5" style="color:var(--red);">Could not load the ledger. Tap Refresh to try again.</td></tr>`;
+    }
+  }
+
+  async function logRow(date, code) {
+    const pair = Object.keys(PAIR_CODE).find(p => PAIR_CODE[p] === code);
+    const rid = date + "_" + code;
+    const body = { pair: pair, outcome: document.getElementById("lr_o_" + rid).value, release_date: date };
+    const pips = document.getElementById("lr_p_" + rid).value;
+    if (String(pips).trim() !== "") body.net_pips = Number(pips);
+    const { ok, data } = await apiPost("/api/admin/cpi-ledger/log", body);
+    if (!ok) { alert(errText(data)); return; }
+    loadCalibration();
+  }
+
+  async function saveCpiConfig() {
+    const v = id => Number(document.getElementById("cfg_" + id).value);
+    const cfg = {
+      deadzoneThreshold: v("deadzoneThreshold"), standardThreshold: v("standardThreshold"), coldEntryThreshold: v("coldEntryThreshold"),
+      weights: { services: v("w_services"), core: v("w_core"), headline: v("w_headline") },
+      pairs: { EURUSD: { pipValuePerLot: v("pip_EURUSD") }, EURGBP: { pipValuePerLot: v("pip_EURGBP") }, EURJPY: { pipValuePerLot: v("pip_EURJPY") } }
+    };
+    const { ok, data } = await apiPost("/api/admin/cpi-config", { config: cfg });
+    document.getElementById("cfgMsg").innerText = ok ? "✅ Saved. Future decodes use these values." : "Could not save: " + errText(data);
+  }
+
+
+  // ---- admin Release Ledger: hit / miss / trap for every release ----
+  let relRows = [];
+  let relStats = {};
+  let relFilter = "ALL";
+  const REL_PILL = { HIT: "hit", MISS: "miss", TRAP: "trap", INLINE: "done", "NO CALL": "done", PENDING: "up" };
+
+  function relLedgerHtml() {
+    const chips = ["ALL", "USD", "GBP", "EUR"].map(c =>
+      `<button class="cur-chip rel-chip${c === "ALL" ? " active" : ""}" data-cur="${c}" onclick="relSetFilter('${c}')">${FILTER_LABEL[c]}</button>`).join("");
+    return `<details class="card desk-only" id="relCard" style="border-color: var(--gold);" ontoggle="if (this.open) loadRelLedger()">
+      <summary style="cursor:pointer; font-weight:800; color:var(--gold-bright);">📒 Release Ledger — Hit / Miss / Trap for Every News Release (Admin Only)</summary>
+      <p style="font-size:0.8rem; color:var(--muted); margin:0.7rem 0;">A release is added when you publish its projection and completed when you send its decoder result. HIT = projection matched the print. MISS = print went the other way. TRAP = the decoder flagged a divergence trap. INLINE = print was flat. NO CALL = no directional projection.</p>
+      <div class="cur-filter">${chips}</div>
+      <div style="overflow-x:auto;"><table>
+        <thead><tr><th>Release</th><th>Releases</th><th>Hit</th><th>Miss</th><th>Trap</th><th>Inline</th><th>No Call</th><th>Pending</th><th>Hit Rate</th></tr></thead>
+        <tbody id="relStats"><tr><td colspan="9" style="color:var(--muted);">Loading...</td></tr></tbody>
+      </table></div>
+      <div style="display:flex; gap:0.6rem; flex-wrap:wrap; margin:0.8rem 0;">
+        <a class="btn-outline" href="/api/admin/release-ledger.csv" style="text-decoration:none; display:inline-block; padding:0.55rem 1rem; border-radius:6px;">⬇️ Export CSV</a>
+        <button class="btn-outline" onclick="loadRelLedger()">🔄 Refresh</button>
+      </div>
+      <div style="overflow-x:auto;"><table>
+        <thead><tr><th>Date</th><th>Release</th><th>Our Call</th><th>Decoder Verdict</th><th>Result</th><th>Correct it</th></tr></thead>
+        <tbody id="relRows"></tbody>
+      </table></div>
+    </details>`;
+  }
+
+  function relSetFilter(cur) {
+    relFilter = cur;
+    document.querySelectorAll(".rel-chip").forEach(c => c.classList.toggle("active", c.dataset.cur === cur));
+    relRender();
+  }
+
+  function relRender() {
+    const stBody = document.getElementById("relStats");
+    if (!stBody) return;
+    const keys = Object.keys(relStats).filter(k => k !== "ALL" && (relFilter === "ALL" || k.indexOf(relFilter + "_") === 0)).sort();
+    const line = (name, b) => `<tr><td><strong>${esc(name)}</strong></td><td>${b.releases}</td><td>${b.HIT}</td><td>${b.MISS}</td><td>${b.TRAP}</td><td>${b.INLINE}</td><td>${b["NO CALL"]}</td><td>${b.PENDING}</td><td>${b.hit_rate === null ? "—" : b.hit_rate + "%"}</td></tr>`;
+    const total = { releases: 0, HIT: 0, MISS: 0, TRAP: 0, INLINE: 0, "NO CALL": 0, PENDING: 0, hit_rate: null };
+    keys.forEach(k => { ["releases", "HIT", "MISS", "TRAP", "INLINE", "NO CALL", "PENDING"].forEach(f => { total[f] += relStats[k][f]; }); });
+    total.hit_rate = (total.HIT + total.MISS) ? Math.round(total.HIT / (total.HIT + total.MISS) * 1000) / 10 : null;
+    stBody.innerHTML = keys.length ? keys.map(k => line(FLAG[k.slice(0, 3)] + " " + k.replace("_", " "), relStats[k])).join("") + line("Total", total)
+      : `<tr><td colspan="9" style="color:var(--muted);">No releases logged yet. Publish a projection and each release appears here automatically.</td></tr>`;
+    const rows = relRows.map((r, i) => ({ r: r, i: i })).filter(x => relFilter === "ALL" || x.r.currency === relFilter);
+    document.getElementById("relRows").innerHTML = rows.length ? rows.map(x => {
+      const r = x.r;
+      const sel = ["HIT", "MISS", "TRAP", "INLINE", "NO CALL"].map(o => `<option value="${o}"${r.result === o ? " selected" : ""}>${o}</option>`).join("");
+      return `<tr><td>${esc(r.release_date)}</td><td><strong>${esc(FLAG[r.currency] || "")} ${esc(r.currency)} ${esc(r.module)}</strong></td>
+        <td>${esc(r.projection_label || "—")}</td><td style="font-size:0.8rem;">${esc(r.decoder_verdict || "Awaiting decode")}</td>
+        <td><span class="pill ${REL_PILL[r.result] || "done"}">${esc(r.result)}</span>${r.manual ? " ✎" : ""}</td>
+        <td><select id="rl_o_${x.i}">${sel}</select> <button class="btn-outline" onclick="relOverride(${x.i})">Save</button></td></tr>`;
+    }).join("") : `<tr><td colspan="6" style="color:var(--muted);">Nothing to show for this filter.</td></tr>`;
+  }
+
+  async function loadRelLedger() {
+    if (!document.getElementById("relStats")) return;
+    try {
+      const res = await fetch("/api/admin/release-ledger", { cache: "no-store" });
+      if (!res.ok) throw new Error("bad response");
+      const data = await res.json();
+      relRows = data.rows; relStats = data.stats;
+      relRender();
+    } catch (e) {
+      document.getElementById("relStats").innerHTML = `<tr><td colspan="9" style="color:var(--red);">Could not load the ledger. Tap Refresh to try again.</td></tr>`;
+    }
+  }
+
+  async function relOverride(i) {
+    const r = relRows[i];
+    const { ok, data } = await apiPost("/api/admin/release-ledger/override", { id: r.id, result: document.getElementById("rl_o_" + i).value });
+    if (!ok) { alert(errText(data)); return; }
+    loadRelLedger();
+  }
+
   // ---- one-time admin setup: new tabs, desk views, schedule panels, queue manager ----
   let v2Ready = false;
   function setupV2Desk() {
@@ -3647,6 +4645,8 @@ def index():
       if (host) host.insertAdjacentHTML("afterend", schedulePanelHtml(k));
     });
     document.getElementById("queueCard").insertAdjacentHTML("beforebegin", sheetHtml());
+    document.getElementById("queueCard").insertAdjacentHTML("beforebegin", relLedgerHtml());
+    document.getElementById("queueCard").insertAdjacentHTML("beforebegin", calibrationHtml());
     document.getElementById("curFilter").innerHTML = ["ALL", "USD", "GBP", "EUR"].map(c =>
       `<button class="cur-chip${c === "ALL" ? " active" : ""}" data-cur="${c}" onclick="setCurFilter('${c}')">${FILTER_LABEL[c]}</button>`).join("");
   }
