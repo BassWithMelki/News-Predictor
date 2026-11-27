@@ -507,6 +507,7 @@ def increment_usage(email: str):
 def register_user(req: RegisterReq, request: Request, response: Response):
     limiter.check(f"register-ip:{client_ip(request)}", 10, 3600)
     full_name, email, whatsapp = validate_registration(req)
+    _screen_signup(email)
     now = utc_stamp()
     conn = get_db_conn()
     ph = ph_for(conn)
@@ -531,6 +532,7 @@ def register_user(req: RegisterReq, request: Request, response: Response):
     finally:
         cur.close()
         conn.close()
+    _record_signup(email, whatsapp, client_ip(request))
     set_session_cookie(response, email)
     return {"status": "ok", "full_name": full_name, "email": email, "is_admin": email == ADMIN_EMAIL}
 
@@ -1423,6 +1425,218 @@ def predict_gbp_jobs(data: GBP_JobsInput, user: str = Depends(require_admin)):
     return _v2_payload(score, buffer, reason, bias, verdict, tier, summary, assets, bias_dir, mult,
                        {"lfs_divergence": lfs_divergence})
 
+# ---------------------------------------------------------------------------
+# UK LABOUR MARKET TERMINAL — MODULE 1: Pre-News v3 Spike Predictor
+# Spec-locked engine. Every constant is deliberate: changing one changes the
+# gate logic. The browser holds a mirror (v3Engine in the page JS) for instant
+# recalculation; /api/predict-gbp-jobs-v3 is the authoritative copy and the two
+# are compared on every tab load so they cannot silently drift.
+# ---------------------------------------------------------------------------
+V3_WEIGHTS = {"dmp": 0.20, "sal": 0.15, "perm": 0.25, "pmi": 0.20, "paye": 0.12, "adzuna": 0.08}
+V3_LABELS = {
+    "dmp":    "BoE DMP wage expectations",
+    "sal":    "REC starting salaries",
+    "perm":   "REC permanent placements",
+    "pmi":    "UK PMI employment",
+    "paye":   "HMRC PAYE payrolls change",
+    "adzuna": "Adzuna job ads",
+}
+V3_WATCH_BAND = 8.0   # inside this distance of the gate: WATCH, still NO TRADE
+
+class GBP_JobsV3Input(BaseModel):
+    user_email: str = ""
+    dmp_curr: float = 4.2
+    dmp_prev: float = 4.2
+    rec_sal_curr: float = 53.5
+    rec_sal_prev: float = 52.0
+    rec_perm_curr: float = 48.5
+    rec_perm_prev: float = 47.0
+    pmi_curr: float = 50.8
+    pmi_prev: float = 49.9
+    paye_k: float = 15.0
+    adzuna_pct: float = 1.2
+    perm_kink_tol: float = 0.5
+    perm_level_tol: float = 0.5
+
+def _v3c(v: float) -> float:
+    return max(-100.0, min(100.0, v))
+
+V3_KINK_AT = 3.0
+V3_KINK_TOL = 0.5
+V3_LEVEL_TOL = 0.5
+
+def _v3_perm_multiplier(delta: float, tol: float):
+    """Placements momentum multiplier with a tolerance band around |delta| = 3.0.
+
+    The raw spec steps 5x -> 10x at exactly |delta| = 3.0, which moves s_perm by about
+    15 points (3.8 composite points) on a 0.01 input change and makes the signal flip
+    at the boundary. Inside the band the multiplier ramps linearly, so the score is
+    continuous; outside it, both calibrated regimes (5x below, 10x above) are untouched.
+    tol = 0 reproduces the original step exactly.
+
+    Returns (multiplier, state) with state in {"below", "band", "above"}.
+    """
+    a = abs(delta)
+    lo, hi = V3_KINK_AT - tol, V3_KINK_AT + tol
+    if tol <= 0 or a <= lo:
+        if a >= V3_KINK_AT:
+            return 10.0, "above"
+        return 5.0, "below"
+    if a >= hi:
+        return 10.0, "above"
+    return 5.0 + 5.0 * ((a - lo) / (hi - lo)), "band"
+
+def _v3_engine(d) -> dict:
+    """The v3 formula exactly as specified. Normalisation, then the four-rule gate
+    in priority order, then the verdict. No smoothing, no extra terms."""
+    perm_delta = d.rec_perm_curr - d.rec_perm_prev
+    kink_tol = max(0.0, min(2.0, float(getattr(d, "perm_kink_tol", V3_KINK_TOL))))
+    perm_mult, perm_kink_state = _v3_perm_multiplier(perm_delta, kink_tol)
+
+    s = {
+        "dmp":    _v3c((d.dmp_curr - 3.5) * 40 + (d.dmp_curr - d.dmp_prev) * 20),
+        "sal":    _v3c((d.rec_sal_curr - 50) * 10 + (d.rec_sal_curr - d.rec_sal_prev) * 5),
+        "perm":   _v3c((d.rec_perm_curr - 50) * 10 + perm_delta * perm_mult),
+        "pmi":    _v3c((d.pmi_curr - 50) * 15 + (d.pmi_curr - d.pmi_prev) * 10),
+        "paye":   _v3c((d.paye_k / 30.0) * 100),
+        "adzuna": _v3c((d.adzuna_pct / 5.0) * 100),
+    }
+    composite = sum(s[k] * V3_WEIGHTS[k] for k in s)
+    pos_count = sum(1 for k in s if s[k] > 0)
+    neg_count = sum(1 for k in s if s[k] < 0)
+
+    level_tol = max(0.0, min(2.0, float(getattr(d, "perm_level_tol", V3_LEVEL_TOL))))
+    wage_override = (d.dmp_curr >= 5.0 and d.rec_sal_curr >= 57.0 and composite > 0)
+    if level_tol > 0 and abs(d.rec_perm_curr - 50.0) < level_tol:
+        # placements are inside the band around 50: their side of the line is not
+        # resolved, so a PAYE/placements split is treated as unresolved, never as
+        # agreement. Unresolved keeps the wide gate.
+        divergence = (d.paye_k != 0)
+        divergence_state = "band"
+    else:
+        divergence = (d.paye_k > 0 and d.rec_perm_curr < 50) or (d.paye_k < 0 and d.rec_perm_curr > 50)
+        divergence_state = "clear"
+    vol_confirmed = ((d.paye_k <= -20 and d.rec_perm_curr <= 48)
+                     or (d.paye_k >= 20 and d.rec_perm_curr >= 52))
+    unanimous = (pos_count >= 5) or (neg_count >= 5)
+
+    if wage_override:
+        gate, rule, code = 22.0, "Wage Override (±22)", "WAGE_OVERRIDE"
+    elif divergence:
+        gate, rule, code = 32.0, "LFS Divergence Filter (±32)", "DIVERGENCE"
+    elif vol_confirmed or unanimous:
+        gate, rule, code = 20.0, "Confirmed Breadth/Volume (±20)", "BREADTH"
+    else:
+        gate, rule, code = 25.0, "Standard Baseline Gate (±25)", "BASELINE"
+
+    if composite >= gate:
+        verdict, vcode = "UPSIDE SPIKE", "UPSIDE"
+    elif composite <= -gate:
+        verdict, vcode = "DOWNSIDE SPIKE", "DOWNSIDE"
+    else:
+        verdict, vcode = "NO TRADE", "NO_TRADE"
+
+    headroom = round(gate - abs(composite), 2)          # >0 means inside the gate
+    watch = (vcode == "NO_TRADE") and (headroom <= V3_WATCH_BAND)
+
+    breakdown = []
+    for k in ("dmp", "sal", "perm", "pmi", "paye", "adzuna"):
+        breakdown.append({
+            "key": k,
+            "label": V3_LABELS[k],
+            "score": round(s[k], 2),
+            "weight": V3_WEIGHTS[k],
+            "contribution": round(s[k] * V3_WEIGHTS[k], 4),
+        })
+
+    notes = []
+    if divergence:
+        notes.append("PAYE %+gK against placements %.1f: the LFS Divergence Filter outranks every other rule and holds the gate open at ±32."
+                     % (d.paye_k, d.rec_perm_curr))
+    if divergence and unanimous:
+        notes.append("Breadth is %d-of-6 (%s) which would normally give ±20, but the divergence rule sits higher in the priority order."
+                     % (pos_count if pos_count >= neg_count else neg_count,
+                        "positive" if pos_count >= neg_count else "negative"))
+    if perm_kink_state == "band":
+        notes.append("Placements momentum %+.2f is inside the tolerance band, so the multiplier is blended at %.2fx "
+                     "instead of stepping between 5x and 10x." % (perm_delta, perm_mult))
+    if kink_tol <= 0 and abs(abs(perm_delta) - V3_KINK_AT) < 0.15:
+        notes.append("Tolerance band is off: the multiplier is a hard step at |Δ| = 3.0, so s_perm can jump about 15 points on a 0.05 input move.")
+    if divergence_state == "band":
+        notes.append("Placements %.2f sit inside the ±%.2f band around 50, so the PAYE split is unresolved rather than agreed: "
+                     "the gate stays wide at ±%.0f." % (d.rec_perm_curr, level_tol, gate))
+    if level_tol <= 0 and abs(d.rec_perm_curr - 50.0) < 0.15:
+        notes.append("Boundary band is off: at exactly 50.00 the divergence test stops firing and the gate can drop from ±32 to ±20.")
+    if watch:
+        notes.append("Score is %.2f inside the gate — lean exists, signal does not." % headroom)
+
+    bias_dir = 1 if vcode == "UPSIDE" else (-1 if vcode == "DOWNSIDE" else 0)
+    mult = 0.55 if bias_dir == 0 else (1.2 if abs(composite) >= gate + 20 else 0.9)
+    assets = [
+        {"pair": "GBP/JPY", "base": 110, "inv": False, "note": "Wage prints move BoE pricing; let the first 5m candle settle"},
+        {"pair": "GBP/USD", "base": 75,  "inv": False, "note": "Follows UK 2Y gilt repricing after the print"},
+        {"pair": "EUR/GBP", "base": 45,  "inv": True,  "note": "Inverse leg; skip on Eurozone news days (rule pending data)"},
+    ]
+
+    if vcode == "UPSIDE":
+        summary = ("UK labour-market proxies lean above consensus (v3 composite %+.2f against a ±%g gate; %s). "
+                   "Lean GBP up once the print confirms." % (composite, gate, rule))
+    elif vcode == "DOWNSIDE":
+        summary = ("UK labour-market proxies lean below consensus (v3 composite %+.2f against a ±%g gate; %s). "
+                   "Lean GBP down once the print confirms." % (composite, gate, rule))
+    else:
+        summary = ("v3 composite %+.2f sits inside the ±%g gate (%s), so there is no pre-news edge. "
+                   "Stand aside and let the print decide." % (composite, gate, rule))
+
+    return {
+        "model": "UK Jobs v3 (pre-news spike predictor)",
+        "version": "v3",
+        "inputs": d.model_dump() if hasattr(d, "model_dump") else d.dict(),
+        "subscores": {k: round(v, 2) for k, v in s.items()},
+        "breakdown": breakdown,
+        "composite": round(composite, 2),
+        "gate": gate,
+        "gate_rule": rule,
+        "gate_code": code,
+        "pos_count": pos_count,
+        "neg_count": neg_count,
+        "headroom": headroom,
+        "watch": watch,
+        "verdict": verdict,
+        "verdict_code": vcode,
+        "bias": "HOTTER" if vcode == "UPSIDE" else ("COOLER" if vcode == "DOWNSIDE" else "NEUTRAL"),
+        "bias_dir": bias_dir,
+        "mult": mult,
+        "tier": "TIER 1 " if bias_dir != 0 and abs(composite) >= gate + 20 else ("TIER 2 " if bias_dir != 0 else ""),
+        "flags": {
+            "wage_override": wage_override,
+            "divergence": divergence,
+            "vol_confirmed": vol_confirmed,
+            "unanimous": unanimous,
+            "perm_delta": round(perm_delta, 4),
+            "perm_multiplier": round(perm_mult, 4),
+            "kink_tolerance": kink_tol,
+            "kink_state": perm_kink_state,
+            "level_tolerance": level_tol,
+            "divergence_state": divergence_state,
+        },
+        "notes": notes,
+        "pairs": _spike_rows(assets, bias_dir, mult, "NO-TRADE / LOW EDGE"),
+        # legacy-shaped fields so the existing publish-to-clients and ledger path,
+        # built for the retired V2 payload, keeps working unchanged
+        "score": round(composite, 1),
+        "buffer": gate,
+        "confidence": min(85, round(50 + abs(composite) * 0.44)),
+        "summary": summary,
+        "untested": [],
+    }
+
+@app.post("/api/predict-gbp-jobs-v3")
+def predict_gbp_jobs_v3(data: GBP_JobsV3Input, user: str = Depends(require_admin)):
+    check_numbers(data)
+    increment_usage(user)
+    return _v3_engine(data)
+
 # ----- shared divergence classifier for the decoders -----
 def _classify(h, c, thr):
     """h / c are signed so that positive = bullish for the currency. Headline = h, Core/Services/Wages = c."""
@@ -1870,8 +2084,13 @@ def next_events(request: Request, response: Response, user: str = Depends(curren
     want_all = is_admin and request.query_params.get("all") == "1"
     conn = get_db_conn()
     cur = conn.cursor()
+    pay_cfg, grants = None, {}
     try:
         events = _read_events(cur, ph_for(conn))
+        if not is_admin:
+            pay_cfg = _pay_cfg_read(cur, ph_for(conn))
+            if pay_cfg["enabled"]:
+                grants = _grants_read(cur, ph_for(conn), user)
     finally:
         cur.close()
         conn.close()
@@ -1907,7 +2126,23 @@ def next_events(request: Request, response: Response, user: str = Depends(curren
         return {"server_time": server_time, "next_date": None, "events": []}
     next_date = live[0][0].strftime("%Y-%m-%d")
     todays = [shape(ev) for r, ev in live if r.strftime("%Y-%m-%d") == next_date]
-    return {"server_time": server_time, "next_date": next_date, "events": todays}
+    if pay_cfg and pay_cfg["enabled"]:
+        free_used = any(g.get("type") == "FREE" for g in grants.values())
+        for e in todays:
+            if not (e.get("released") or e.get("decoded")):
+                continue   # countdown-only cards hold nothing to protect
+            ekey = _event_key(e)
+            if ekey in grants:
+                e["locked"] = False
+                continue
+            if not free_used and _try_free_grant(user, e):
+                free_used = True
+                e["locked"] = False
+                continue
+            e["locked"] = True
+            e["result"], e["decoded"], e["inputs"] = None, None, {}
+    return {"server_time": server_time, "next_date": next_date, "events": todays,
+            "payments": {"enabled": bool(pay_cfg and pay_cfg["enabled"]), "price_kes": (pay_cfg or PAY_CFG_DEFAULT)["price_kes"]}}
 
 # ---------------------------------------------------------------------------
 # Eurozone CPI Post-Release Decoder v2 + admin ledger / calibration
@@ -2574,6 +2809,538 @@ def release_ledger_csv(admin: str = Depends(require_admin)):
     return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": 'attachment; filename="release_ledger.csv"', "Cache-Control": "no-store"})
 
+# ---------------------------------------------------------------------------
+# Payments (Paystack, M-Pesa) + per-event access + sign-up abuse checks
+# Nothing here changes behaviour until the admin turns payments ON in the Payments card.
+# Everything is stored in site_settings (no schema change). Keys come from Render environment settings.
+# ---------------------------------------------------------------------------
+try:
+    from starlette.concurrency import run_in_threadpool
+except ImportError:  # very old Starlette: fall back to calling directly
+    run_in_threadpool = None
+
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
+PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", "").strip()
+PAYSTACK_API = "https://api.paystack.co"
+PAY_CFG_KEY = "pay_config"
+PAY_PAYMENTS_KEY = "pay_payments"
+PAY_FREE_KEY = "pay_free_ids"
+PAY_DENIED_KEY = "pay_denied"
+SIGNUP_META_KEY = "signup_meta"
+PAY_CFG_DEFAULT = {"enabled": False, "price_kes": 400, "free_first_event": True}
+PAY_MAX_PAYMENTS = 6000
+PAY_STORE_CHARS = 5_000_000
+_PAY_LOCK = threading.Lock()
+
+DISPOSABLE_DOMAINS = {
+    "mailinator.com", "guerrillamail.com", "guerrillamail.net", "guerrillamail.org", "10minutemail.com",
+    "10minutemail.net", "tempmail.com", "temp-mail.org", "temp-mail.io", "yopmail.com", "yopmail.net",
+    "throwawaymail.com", "trashmail.com", "trashmail.net", "sharklasers.com", "getnada.com", "maildrop.cc",
+    "dispostable.com", "fakeinbox.com", "mintemail.com", "mohmal.com", "emailondeck.com", "mailnesia.com",
+    "tempr.email", "discard.email", "spambox.us", "mytemp.email", "burnermail.io", "inboxkitten.com",
+    "moakt.com", "tmpmail.org", "tmail.ws", "tempail.com", "tempinbox.com", "mailcatch.com", "spamgourmet.com",
+    "getairmail.com", "mailforspam.com", "mail-temp.com", "emailfake.com", "fakemail.net", "luxusmail.org",
+    "33mail.com", "anonbox.net", "grr.la", "guerrillamailblock.com", "pokemail.net", "tempmailo.com",
+}
+
+def _norm_email(email: str) -> str:
+    local, _, domain = (email or "").strip().lower().partition("@")
+    local = local.split("+", 1)[0]
+    if domain in ("gmail.com", "googlemail.com"):
+        local, domain = local.replace(".", ""), "gmail.com"
+    return f"{local}@{domain}"
+
+def _phone_key(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone or "")
+    return digits[-9:] if len(digits) >= 9 else ""
+
+def _screen_signup(email: str):
+    if email.rsplit("@", 1)[-1] in DISPOSABLE_DOMAINS:
+        raise HTTPException(status_code=400, detail="Please use a permanent email address. Temporary email services are not accepted.")
+
+def _record_signup(email: str, whatsapp: str, ip: str):
+    """Remember where each account came from, for the admin review list. Never blocks a sign-up."""
+    try:
+        with _PAY_LOCK:
+            conn = get_db_conn(); cur = conn.cursor()
+            try:
+                ph = ph_for(conn)
+                meta = _setting_get(cur, ph, SIGNUP_META_KEY) or {}
+                meta[email] = {"ip": ip, "norm": _norm_email(email), "phone": _phone_key(whatsapp), "at": _utc_iso()}
+                if len(meta) > 15000:
+                    for k in sorted(meta, key=lambda x: meta[x].get("at", ""))[: len(meta) - 15000]:
+                        del meta[k]
+                _setting_set(conn, cur, SIGNUP_META_KEY, meta, PAY_STORE_CHARS)
+                conn.commit()
+            finally:
+                cur.close(); conn.close()
+    except Exception:
+        log.exception("Could not record sign-up details")
+
+def _pay_cfg_read(cur, ph):
+    cfg = dict(PAY_CFG_DEFAULT)
+    saved = _setting_get(cur, ph, PAY_CFG_KEY)
+    if isinstance(saved, dict):
+        if isinstance(saved.get("enabled"), bool):
+            cfg["enabled"] = saved["enabled"]
+        if isinstance(saved.get("free_first_event"), bool):
+            cfg["free_first_event"] = saved["free_first_event"]
+        p = saved.get("price_kes")
+        if isinstance(p, (int, float)) and not isinstance(p, bool) and 1 <= p <= 200000:
+            cfg["price_kes"] = p
+    return cfg
+
+def _grants_read(cur, ph, email):
+    g = _setting_get(cur, ph, f"pay_grants:{email}")
+    return g if isinstance(g, dict) else {}
+
+def _event_key(ev):
+    return f"{str(ev.get('release_utc', ''))[:10]}|{ev.get('event_id')}"
+
+def _record_payment_row(payments, rec):
+    payments[rec["reference"]] = rec
+    if len(payments) > PAY_MAX_PAYMENTS:
+        for k in sorted(payments, key=lambda x: payments[x].get("created_at", ""))[: len(payments) - PAY_MAX_PAYMENTS]:
+            del payments[k]
+
+def _grant_access(conn, cur, ph, email, ekey, grant, payments=None):
+    """Caller holds _PAY_LOCK and commits."""
+    grants = _grants_read(cur, ph, email)
+    grants[ekey] = grant
+    _setting_set(conn, cur, f"pay_grants:{email}", grants, 200_000)
+
+def _try_free_grant(email, ev):
+    """Give a new account its one free event. Returns True if the event is now unlocked for it."""
+    ekey = _event_key(ev)
+    with _PAY_LOCK:
+        conn = get_db_conn(); cur = conn.cursor()
+        try:
+            ph = ph_for(conn)
+            cfg = _pay_cfg_read(cur, ph)
+            if not (cfg["enabled"] and cfg["free_first_event"]):
+                return False
+            grants = _grants_read(cur, ph, email)
+            if ekey in grants:
+                return True
+            if any(g.get("type") == "FREE" for g in grants.values()):
+                return False
+            denied = _setting_get(cur, ph, PAY_DENIED_KEY) or {}
+            if email in denied:
+                return False
+            cur.execute(f"SELECT whatsapp FROM users WHERE email = {ph}", (email,))
+            row = cur.fetchone()
+            ids = ["e:" + _norm_email(email)]
+            pk = _phone_key(row["whatsapp"]) if row else ""
+            if pk:
+                ids.append("p:" + pk)
+            free_ids = _setting_get(cur, ph, PAY_FREE_KEY) or {}
+            clash = [i for i in ids if free_ids.get(i) not in (None, email)]
+            if clash:
+                denied[email] = {"reason": "Free event already used by " + str(free_ids.get(clash[0])), "at": _utc_iso()}
+                _setting_set(conn, cur, PAY_DENIED_KEY, denied, 500_000)
+                conn.commit()
+                return False
+            for i in ids:
+                free_ids[i] = email
+            _setting_set(conn, cur, PAY_FREE_KEY, free_ids, PAY_STORE_CHARS)
+            now = _utc_iso()
+            _grant_access(conn, cur, ph, email, ekey, {"type": "FREE", "at": now})
+            payments = _setting_get(cur, ph, PAY_PAYMENTS_KEY) or {}
+            _record_payment_row(payments, {
+                "reference": "free-" + secrets.token_hex(6), "email": email, "event_key": ekey,
+                "event_id": ev.get("event_id"), "release_date": ekey.split("|")[0], "amount_kes": 0,
+                "amount_cents": 0, "currency": "KES", "method": "FREE", "status": "SUCCESS",
+                "created_at": now, "paid_at": now})
+            _setting_set(conn, cur, PAY_PAYMENTS_KEY, payments, PAY_STORE_CHARS)
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback(); log.exception("Free event grant failed")
+            return False
+        finally:
+            cur.close(); conn.close()
+
+def _base_url(request: Request) -> str:
+    env = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if env:
+        return env
+    proto = request.headers.get("x-forwarded-proto") or ("https" if COOKIE_SECURE else "http")
+    return f"{proto.split(',')[0].strip()}://{request.headers.get('host', 'localhost')}"
+
+class PayStartReq(BaseModel):
+    event_id: str
+
+@app.post("/api/pay/start")
+def pay_start(req: PayStartReq, request: Request, user: str = Depends(current_user)):
+    limiter.check(f"pay-start:{user}", 10, 600)
+    if not PAYSTACK_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Payments are not set up yet. Please try again later.")
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        ph = ph_for(conn)
+        cfg = _pay_cfg_read(cur, ph)
+        events = _read_events(cur, ph)
+        grants = _grants_read(cur, ph, user)
+    finally:
+        cur.close(); conn.close()
+    if not cfg["enabled"]:
+        raise HTTPException(status_code=400, detail="Payments are not open yet.")
+    ev = events.get(req.event_id)
+    if not ev or not (ev.get("released") or ev.get("decoded")):
+        raise HTTPException(status_code=404, detail="That event is not available to unlock.")
+    ekey = _event_key(ev)
+    if ekey in grants:
+        return {"already": True}
+    reference = "am-" + secrets.token_hex(10)
+    cents = int(round(cfg["price_kes"] * 100))
+    body = {"email": user, "amount": cents, "currency": "KES", "reference": reference,
+            "callback_url": _base_url(request) + "/", "metadata": {"event_key": ekey, "app_user": user}}
+    try:
+        r = requests.post(f"{PAYSTACK_API}/transaction/initialize", json=body, timeout=15,
+                          headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"})
+        data = r.json()
+    except Exception:
+        log.exception("Paystack initialize failed")
+        raise HTTPException(status_code=502, detail="Could not reach the payment service. Please try again.")
+    if r.status_code >= 400 or not data.get("status") or not (data.get("data") or {}).get("authorization_url"):
+        log.warning("Paystack initialize rejected: %s", str(data)[:300])
+        raise HTTPException(status_code=502, detail="The payment service did not accept the request. Please try again later.")
+    now = _utc_iso()
+    with _PAY_LOCK:
+        conn = get_db_conn(); cur = conn.cursor()
+        try:
+            ph = ph_for(conn)
+            payments = _setting_get(cur, ph, PAY_PAYMENTS_KEY) or {}
+            _record_payment_row(payments, {
+                "reference": reference, "email": user, "event_key": ekey, "event_id": ev["event_id"],
+                "release_date": ekey.split("|")[0], "amount_kes": cfg["price_kes"], "amount_cents": cents,
+                "currency": "KES", "method": "PAID", "status": "PENDING", "created_at": now, "paid_at": None})
+            _setting_set(conn, cur, PAY_PAYMENTS_KEY, payments, PAY_STORE_CHARS)
+            conn.commit()
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception:
+            conn.rollback(); log.exception("Saving pending payment failed")
+            raise HTTPException(status_code=500, detail="Could not start the payment. Please try again.")
+        finally:
+            cur.close(); conn.close()
+    return {"authorization_url": data["data"]["authorization_url"], "reference": reference}
+
+def _fulfil_payment(reference: str):
+    """Ask Paystack directly whether this reference was paid, then unlock the event. Safe to call repeatedly."""
+    if not PAYSTACK_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Payments are not set up yet.")
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        payments = _setting_get(cur, ph_for(conn), PAY_PAYMENTS_KEY) or {}
+    finally:
+        cur.close(); conn.close()
+    pay = payments.get(reference)
+    if not pay:
+        raise HTTPException(status_code=404, detail="Payment not found.")
+    if pay.get("status") == "SUCCESS":
+        return {"status": "SUCCESS", "event_id": pay.get("event_id")}
+    try:
+        r = requests.get(f"{PAYSTACK_API}/transaction/verify/{reference}", timeout=15,
+                         headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"})
+        body = r.json()
+    except Exception:
+        log.exception("Paystack verify failed")
+        return {"status": "PENDING", "event_id": pay.get("event_id")}
+    d = body.get("data") or {}
+    status = str(d.get("status") or "").lower()
+    if r.status_code >= 400 or not body.get("status"):
+        return {"status": "PENDING", "event_id": pay.get("event_id")}
+    if status != "success":
+        new = "FAILED" if status in ("failed", "reversed") else "PENDING"
+        if new == "FAILED":
+            _set_payment_status(reference, "FAILED", d)
+        return {"status": new, "event_id": pay.get("event_id")}
+    if d.get("amount") != pay.get("amount_cents") or str(d.get("currency") or "KES").upper() != "KES":
+        log.warning("Payment amount mismatch for %s: %s %s", reference, d.get("amount"), d.get("currency"))
+        _set_payment_status(reference, "FAILED", d, note="amount mismatch")
+        return {"status": "FAILED", "event_id": pay.get("event_id")}
+    with _PAY_LOCK:
+        conn = get_db_conn(); cur = conn.cursor()
+        try:
+            ph = ph_for(conn)
+            payments = _setting_get(cur, ph, PAY_PAYMENTS_KEY) or {}
+            rec = payments.get(reference)
+            if rec and rec.get("status") != "SUCCESS":
+                now = _utc_iso()
+                rec.update({"status": "SUCCESS", "paid_at": now, "channel": d.get("channel")})
+                _grant_access(conn, cur, ph, rec["email"], rec["event_key"], {"type": "PAID", "at": now, "reference": reference})
+                _setting_set(conn, cur, PAY_PAYMENTS_KEY, payments, PAY_STORE_CHARS)
+                conn.commit()
+        except Exception:
+            conn.rollback(); log.exception("Unlocking after payment failed")
+            raise HTTPException(status_code=500, detail="Payment received but unlocking failed. Please contact support with your reference.")
+        finally:
+            cur.close(); conn.close()
+    return {"status": "SUCCESS", "event_id": pay.get("event_id")}
+
+def _set_payment_status(reference, status, d, note=None):
+    with _PAY_LOCK:
+        conn = get_db_conn(); cur = conn.cursor()
+        try:
+            ph = ph_for(conn)
+            payments = _setting_get(cur, ph, PAY_PAYMENTS_KEY) or {}
+            rec = payments.get(reference)
+            if rec and rec.get("status") != "SUCCESS":
+                rec["status"] = status
+                if note:
+                    rec["note"] = note
+                _setting_set(conn, cur, PAY_PAYMENTS_KEY, payments, PAY_STORE_CHARS)
+                conn.commit()
+        except Exception:
+            conn.rollback(); log.exception("Updating payment status failed")
+        finally:
+            cur.close(); conn.close()
+
+@app.get("/api/pay/verify")
+def pay_verify(reference: str, user: str = Depends(current_user)):
+    limiter.check(f"pay-verify:{user}", 30, 600)
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        pay = (_setting_get(cur, ph_for(conn), PAY_PAYMENTS_KEY) or {}).get(reference)
+    finally:
+        cur.close(); conn.close()
+    if not pay or (pay.get("email") != user and user != ADMIN_EMAIL):
+        raise HTTPException(status_code=404, detail="Payment not found.")
+    return _fulfil_payment(reference)
+
+@app.post("/api/pay/check")
+def pay_check(req: PayStartReq, user: str = Depends(current_user)):
+    """The client says 'I already paid': re-check their most recent pending payments for this event."""
+    limiter.check(f"pay-check:{user}", 20, 600)
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        payments = _setting_get(cur, ph_for(conn), PAY_PAYMENTS_KEY) or {}
+    finally:
+        cur.close(); conn.close()
+    mine = sorted([p for p in payments.values() if p.get("email") == user and p.get("event_id") == req.event_id and p.get("status") == "PENDING"],
+                  key=lambda p: p.get("created_at", ""), reverse=True)[:3]
+    unlocked = False
+    for p in mine:
+        if _fulfil_payment(p["reference"]).get("status") == "SUCCESS":
+            unlocked = True
+    return {"unlocked": unlocked, "checked": len(mine)}
+
+def _verify_webhook(raw: bytes, headers) -> bool:
+    new_sig = headers.get("paystack-signature")
+    if new_sig and PAYSTACK_WEBHOOK_SECRET:
+        t, entries = None, []
+        for part in new_sig.split(","):
+            k, _, v = part.partition("=")
+            k, v = k.strip(), v.strip()
+            if k == "t" and v.isdigit():
+                t = int(v)
+            elif k == "v1" and ":" in v:
+                entries.append(v.split(":", 1)[1])
+        if t is not None and entries and abs(time.time() - t) <= 300:
+            expected = hmac.new(PAYSTACK_WEBHOOK_SECRET.encode(), f"{t}.".encode() + raw, hashlib.sha512).hexdigest()
+            if any(hmac.compare_digest(expected, h.lower()) for h in entries):
+                return True
+    old_sig = headers.get("x-paystack-signature")
+    if old_sig and PAYSTACK_SECRET_KEY:
+        expected = hmac.new(PAYSTACK_SECRET_KEY.encode(), raw, hashlib.sha512).hexdigest()
+        if hmac.compare_digest(expected, old_sig.lower()):
+            return True
+    return False
+
+@app.post("/api/paystack/webhook")
+async def paystack_webhook(request: Request):
+    raw = await request.body()
+    if not _verify_webhook(raw, request.headers):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+    try:
+        event = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {"status": "ignored"}
+    if event.get("event") == "charge.success":
+        ref = (event.get("data") or {}).get("reference")
+        if ref:
+            try:
+                if run_in_threadpool:
+                    await run_in_threadpool(_fulfil_payment, ref)
+                else:
+                    _fulfil_payment(ref)
+            except HTTPException:
+                pass   # unknown reference or setup problem: acknowledge so Paystack does not keep retrying
+            except Exception:
+                log.exception("Webhook fulfilment failed")
+    return {"status": "ok"}
+
+# ---------------- admin: config, payments list, manual approval, review list ----------------
+class PayConfigReq(BaseModel):
+    enabled: bool
+    price_kes: float
+    free_first_event: bool
+
+@app.get("/api/admin/pay-config")
+def get_pay_config(request: Request, admin: str = Depends(require_admin)):
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        cfg = _pay_cfg_read(cur, ph_for(conn))
+    finally:
+        cur.close(); conn.close()
+    return {"config": cfg, "secret_set": bool(PAYSTACK_SECRET_KEY), "webhook_secret_set": bool(PAYSTACK_WEBHOOK_SECRET),
+            "webhook_url": _base_url(request) + "/api/paystack/webhook",
+            "mode": ("live" if PAYSTACK_SECRET_KEY.startswith("sk_live") else "test" if PAYSTACK_SECRET_KEY.startswith("sk_test") else "unset")}
+
+@app.post("/api/admin/pay-config")
+def save_pay_config(req: PayConfigReq, admin: str = Depends(require_admin)):
+    price = _num(req.price_kes, 1, 200000, "price_kes")
+    if req.enabled and not PAYSTACK_SECRET_KEY:
+        raise HTTPException(status_code=400, detail="Add PAYSTACK_SECRET_KEY in Render's environment settings before turning payments on.")
+    cfg = {"enabled": bool(req.enabled), "price_kes": price, "free_first_event": bool(req.free_first_event)}
+    with _PAY_LOCK:
+        conn = get_db_conn(); cur = conn.cursor()
+        try:
+            _setting_set(conn, cur, PAY_CFG_KEY, cfg, 5_000)
+            conn.commit()
+        except Exception:
+            conn.rollback(); raise
+        finally:
+            cur.close(); conn.close()
+    log.info("Payment settings updated: enabled=%s price=%s", cfg["enabled"], cfg["price_kes"])
+    return {"status": "ok", "config": cfg}
+
+def _abuse_review():
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        ph = ph_for(conn)
+        cur.execute("SELECT email, whatsapp, created_at FROM users")
+        users = [dict(r) for r in cur.fetchall()]
+        meta = _setting_get(cur, ph, SIGNUP_META_KEY) or {}
+        denied = _setting_get(cur, ph, PAY_DENIED_KEY) or {}
+    finally:
+        cur.close(); conn.close()
+    groups = defaultdict(list)
+    for u in users:
+        groups[("SAME EMAIL INBOX", _norm_email(u["email"]))].append(u["email"])
+        pk = _phone_key(u.get("whatsapp", ""))
+        if pk:
+            groups[("SAME PHONE NUMBER", pk)].append(u["email"])
+    for email, m in meta.items():
+        if m.get("ip"):
+            groups[("SAME NETWORK (IP)", m["ip"])].append(email)
+    out = []
+    for (kind, key), emails in groups.items():
+        emails = sorted(set(emails))
+        if len(emails) >= (3 if kind.startswith("SAME NETWORK") else 2):
+            out.append({"kind": kind, "key": key, "accounts": emails})
+    for email, d in denied.items():
+        out.append({"kind": "FREE EVENT REFUSED", "key": d.get("reason", ""), "accounts": [email]})
+    return out
+
+def _payment_summary(payments):
+    rows = sorted(payments.values(), key=lambda p: p.get("created_at", ""), reverse=True)
+    paid = [p for p in rows if p["method"] == "PAID" and p["status"] == "SUCCESS"]
+    by_event = {}
+    for p in rows:
+        if p["status"] != "SUCCESS":
+            continue
+        b = by_event.setdefault(p["event_key"], {"paid": 0, "free": 0, "admin": 0, "revenue_kes": 0})
+        b[{"PAID": "paid", "FREE": "free", "ADMIN": "admin"}.get(p["method"], "paid")] += 1
+        b["revenue_kes"] += p.get("amount_kes") or 0
+    return rows, {
+        "revenue_kes": sum(p.get("amount_kes") or 0 for p in paid), "paid_count": len(paid),
+        "free_count": sum(1 for p in rows if p["method"] == "FREE"),
+        "admin_count": sum(1 for p in rows if p["method"] == "ADMIN"),
+        "pending": sum(1 for p in rows if p["status"] == "PENDING"), "by_event": by_event}
+
+@app.get("/api/admin/payments")
+def admin_payments(response: Response, admin: str = Depends(require_admin)):
+    response.headers["Cache-Control"] = "no-store"
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        payments = _setting_get(cur, ph_for(conn), PAY_PAYMENTS_KEY) or {}
+    finally:
+        cur.close(); conn.close()
+    rows, summary = _payment_summary(payments)
+    return {"payments": rows[:200], "summary": summary, "review": _abuse_review()}
+
+class PayApproveReq(BaseModel):
+    email: str
+    event_id: str
+    release_date: Optional[str] = None
+
+@app.post("/api/admin/payments/approve")
+def approve_payment(req: PayApproveReq, admin: str = Depends(require_admin)):
+    """Manual approval (backup if a payment confirmation never arrives, or to gift an event)."""
+    email = req.email.strip().lower()
+    with _PAY_LOCK:
+        conn = get_db_conn(); cur = conn.cursor()
+        try:
+            ph = ph_for(conn)
+            cur.execute(f"SELECT 1 FROM users WHERE email = {ph}", (email,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="No account with that email.")
+            date = (req.release_date or "").strip()
+            if date:
+                if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+                    raise HTTPException(status_code=422, detail="'release_date' must look like 2026-12-04.")
+            else:
+                ev = _read_events(cur, ph).get(req.event_id)
+                if not ev:
+                    raise HTTPException(status_code=404, detail="That event is not in the queue. Enter its release date.")
+                date = str(ev["release_utc"])[:10]
+            ekey = f"{date}|{req.event_id}"
+            now = _utc_iso()
+            _grant_access(conn, cur, ph, email, ekey, {"type": "ADMIN", "at": now})
+            payments = _setting_get(cur, ph, PAY_PAYMENTS_KEY) or {}
+            _record_payment_row(payments, {
+                "reference": "admin-" + secrets.token_hex(6), "email": email, "event_key": ekey,
+                "event_id": req.event_id, "release_date": date, "amount_kes": 0, "amount_cents": 0,
+                "currency": "KES", "method": "ADMIN", "status": "SUCCESS", "created_at": now, "paid_at": now})
+            _setting_set(conn, cur, PAY_PAYMENTS_KEY, payments, PAY_STORE_CHARS)
+            conn.commit()
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback(); log.exception("Manual approval failed")
+            raise HTTPException(status_code=500, detail=f"Could not approve: {_first_line(e)}")
+        finally:
+            cur.close(); conn.close()
+    return {"status": "ok", "event_key": ekey}
+
+@app.post("/api/admin/payments/recheck")
+def recheck_payments(admin: str = Depends(require_admin)):
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        payments = _setting_get(cur, ph_for(conn), PAY_PAYMENTS_KEY) or {}
+    finally:
+        cur.close(); conn.close()
+    pending = [p for p in payments.values() if p.get("status") == "PENDING"][:25]
+    fixed = 0
+    for p in pending:
+        try:
+            if _fulfil_payment(p["reference"]).get("status") == "SUCCESS":
+                fixed += 1
+        except HTTPException:
+            pass
+    return {"checked": len(pending), "unlocked": fixed}
+
+PAY_CSV_COLUMNS = ["created_at", "paid_at", "reference", "email", "event_id", "release_date", "method", "status",
+                   "amount_kes", "currency", "channel", "note"]
+
+@app.get("/api/admin/payments.csv")
+def payments_csv(admin: str = Depends(require_admin)):
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        payments = _setting_get(cur, ph_for(conn), PAY_PAYMENTS_KEY) or {}
+    finally:
+        cur.close(); conn.close()
+    rows, _ = _payment_summary(payments)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(PAY_CSV_COLUMNS)
+    for r in reversed(rows):
+        w.writerow([_csv_cell(r.get(c)) for c in PAY_CSV_COLUMNS])
+    return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="payments.csv"', "Cache-Control": "no-store"})
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """<!DOCTYPE html>
@@ -2642,6 +3409,64 @@ def index():
   .cur-filter { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.9rem; }
   .cur-chip { padding: 0.5rem 1rem; border-radius: 999px; border: 1px solid var(--border); background: var(--card); color: var(--muted); font-weight: 800; cursor: pointer; font-size: 0.85rem; }
   .cur-chip.active { border-color: var(--gold); color: var(--gold-bright); background: #04140f; }
+  /* ---- UK Labour Market Terminal: Module 1 / Module 2 ---- */
+  .v3-sub { font-size: 0.8rem; color: var(--muted); margin-bottom: 0.9rem; }
+  .v3-kpi { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.6rem; margin-bottom: 1rem; }
+  .v3-tile { background: #04140f; border: 1px solid var(--border); border-radius: 10px; padding: 0.7rem 0.8rem; }
+  .v3-tile .k { font-size: 0.66rem; letter-spacing: 1.2px; text-transform: uppercase; color: var(--muted); font-weight: 800; }
+  .v3-tile .v { font-size: 1.3rem; font-weight: 900; font-variant-numeric: tabular-nums; line-height: 1.25; }
+  .v3-tile .s { font-size: 0.7rem; color: var(--muted); }
+  .v3-gauge { position: relative; height: 62px; margin: 0.6rem 0 0.9rem; }
+  .v3-track { position: absolute; top: 22px; left: 0; right: 0; height: 16px; border-radius: 8px; border: 1px solid var(--border);
+              background: linear-gradient(90deg, #7f1d1d 0%, #3f2a12 34%, #1b3a2c 50%, #3f2a12 66%, #14532d 100%); }
+  .v3-band { position: absolute; top: 17px; height: 26px; border-radius: 7px; background: rgba(212,175,55,0.16);
+             border: 1px dashed var(--gold); pointer-events: none; }
+  .v3-needle { position: absolute; top: 8px; width: 2px; height: 44px; background: var(--gold-bright);
+               box-shadow: 0 0 8px rgba(243,207,101,0.85); }
+  .v3-needle span { position: absolute; top: -18px; left: 50%; transform: translateX(-50%); font-size: 0.7rem;
+                    font-weight: 900; color: var(--gold-bright); white-space: nowrap; }
+  .v3-scale { position: absolute; bottom: -10px; left: 0; right: 0; height: 10px; font-size: 0.62rem; color: var(--muted); }
+  .v3-scale span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+  .badge-up { background: rgba(16,185,129,0.16); border: 1px solid var(--green); color: #6ee7b7; }
+  .badge-down { background: rgba(239,68,68,0.16); border: 1px solid var(--red); color: #fca5a5; }
+  .badge-flat { background: rgba(245,158,11,0.16); border: 1px solid var(--amber); color: #fcd34d; }
+  .badge-watch { background: rgba(245,158,11,0.10); border: 1px dashed var(--amber); color: #fcd34d; }
+  .v3-badge { display: inline-block; padding: 0.28rem 0.7rem; border-radius: 999px; font-size: 0.82rem; font-weight: 900; letter-spacing: 0.4px; }
+  .v3-tier { font-size: 0.72rem; color: var(--muted); font-weight: 700; }
+  table.v3-table td.num, table.v3-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .mini-bar { position: relative; height: 8px; width: 84px; background: #04140f; border: 1px solid var(--border);
+              border-radius: 4px; overflow: hidden; }
+  .mini-bar::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--border); }
+  .mini-bar i { position: absolute; top: 0; bottom: 0; }
+  .mini-bar i.pos { left: 50%; background: var(--green); }
+  .mini-bar i.neg { right: 50%; background: var(--red); }
+  .v3-inline-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.85rem; }
+  .v3-parity { font-size: 0.75rem; color: var(--muted); margin-top: 0.55rem; }
+  .v3-rec { margin-top: 0.9rem; padding: 0.75rem 0.85rem; background: #04140f; border: 1px solid var(--border);
+            border-radius: 8px; font-size: 0.8rem; }
+  .v3-notes { margin-top: 0.9rem; font-size: 0.8rem; color: var(--muted); }
+  .v3-notes summary { cursor: pointer; color: var(--gold-bright); font-weight: 700; }
+  .v3-notes ul { margin: 0.5rem 0 0 1.1rem; }
+  .v3-notes li { margin-bottom: 0.3rem; }
+  .m2-card { border-color: var(--gold); }
+  .m2-empty { text-align: center; padding: 1.4rem 1rem; border: 1px dashed var(--border); border-radius: 10px; background: #04140f; }
+  .m2-empty p { font-size: 0.85rem; color: var(--muted); margin-bottom: 0.9rem; }
+  .m2-banner { padding: 0.7rem 0.85rem; border-radius: 8px; font-size: 0.8rem; margin-bottom: 0.9rem; line-height: 1.45; }
+  .m2-banner.block { background: rgba(239,68,68,0.10); border: 1px solid var(--red); color: #fecaca; }
+  .m2-banner.info { background: rgba(212,175,55,0.10); border: 1px solid var(--gold); color: var(--gold-bright); }
+  .m2-banner.ok { background: rgba(16,185,129,0.10); border: 1px solid var(--green); color: #a7f3d0; }
+  .untested { display: inline-block; padding: 0.1rem 0.45rem; border: 1px dashed var(--amber); border-radius: 999px;
+              color: #fcd34d; font-size: 0.66rem; font-weight: 800; letter-spacing: 0.3px; }
+  .missing { display: inline-block; padding: 0.1rem 0.45rem; border: 1px solid var(--red); border-radius: 999px;
+             color: #fca5a5; font-size: 0.66rem; font-weight: 800; letter-spacing: 0.3px; }
+  .m2-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; margin-bottom: 0.9rem; }
+  @media (max-width: 760px) { .m2-grid { grid-template-columns: 1fr; } }
+  .m2-sec { margin-top: 1rem; }
+  .m2-sec > h3 { font-size: 0.82rem; color: var(--gold-bright); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem; }
+  .m2-scroll { overflow-x: auto; }
+  .m2-ticket { border: 1px dashed var(--red); border-radius: 8px; padding: 0.85rem; background: rgba(239,68,68,0.06); }
+  .m2-ticket h4 { color: #fca5a5; font-size: 0.85rem; margin-bottom: 0.4rem; }
+  .m2-ticket p { font-size: 0.8rem; color: #fecaca; }
   .pill { display: inline-block; padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 0.72rem; font-weight: 800; border: 1px solid var(--border); }
   .pill.up { color: var(--gold-bright); border-color: var(--gold); }
   .pill.live { color: #fff; background: #7f1d1d; border-color: var(--red); }
@@ -3108,6 +3933,7 @@ def index():
 
     <div id="clientQueue" class="client-only">
       <h2 style="margin-bottom:0.75rem;"><span>⏳ Next Scheduled Release</span></h2>
+      <div id="payBanner"></div>
       <div id="clientQueueBody"><div class="card"><p style="color:var(--muted);">Loading the next event...</p></div></div>
     </div>
   </div>
@@ -3710,6 +4536,28 @@ def index():
       note: "LFS divergence filter is automatic: if HMRC PAYE and REC placements point in opposite directions, the gate widens from ±25 to ±32.",
       labels: { up: "HAWKISH WAGE-LED JOBS (GBP BULLISH)", down: "SOFT WAGE-LED JOBS (GBP BEARISH)", flat: "NO-TRADE / LOW EDGE" }
     },
+    GBP_JOBS_V3: {
+      cur: "GBP", prefix: "gbpj3", api: "/api/predict-gbp-jobs-v3",
+      title: "UK Labour Market — v3 Spike Predictor", heading: "Pre-News v3 Leading Proxies",
+      tabLabel: "🇬🇧 UK Jobs V3 — Spike",
+      fields: [
+        ["dmp_curr", "BoE DMP Wage Expectations — current (%)", 4.2, 0.1],
+        ["dmp_prev", "BoE DMP Wage Expectations — previous (%)", 4.2, 0.1],
+        ["rec_sal_curr", "REC Starting Salaries — current", 53.5, 0.1],
+        ["rec_sal_prev", "REC Starting Salaries — previous", 52.0, 0.1],
+        ["rec_perm_curr", "REC Permanent Placements — current", 48.5, 0.1],
+        ["rec_perm_prev", "REC Permanent Placements — previous", 47.0, 0.1],
+        ["perm_kink_tol", "Tolerance band — placements momentum kink at |Δ| = 3.0 (±)", 0.5, 0.1],
+        ["perm_level_tol", "Tolerance band — placements level around 50 (±)", 0.5, 0.1],
+        ["pmi_curr", "UK PMI Employment — current", 50.8, 0.1],
+        ["pmi_prev", "UK PMI Employment — previous", 49.9, 0.1],
+        ["paye_k", "HMRC PAYE Payrolls Change (K)", 15.0, 1],
+        ["adzuna_pct", "Adzuna Job Ads (% Δ)", 1.2, 0.1]
+      ],
+      checks: [],
+      note: "v3 sits alongside the installed V2 model. Same weights, different normalisation: v3 reads placements against the 50 level and runs four gate rules.",
+      labels: { up: "UPSIDE SPIKE", down: "DOWNSIDE SPIKE", flat: "NO TRADE" }
+    },
     EUR_CPI: {
       cur: "EUR", prefix: "eurcpi", api: "/api/predict-eur-cpi", title: "EUROZONE FLASH CPI PROXY v3",
       heading: "Eurozone Flash CPI Proxy v3 Inputs", tabLabel: "🇪🇺 EUR Flash CPI v3",
@@ -3761,7 +4609,7 @@ def index():
   MODS.USD_PPI.labels  = MODULE_LABELS.PPI;
   MODS.USD_FOMC.labels = MODULE_LABELS.FOMC;
   const USD_PAYLOAD = { USD_NFP: nfpPayload, USD_CPI: cpiPayload, USD_PPI: ppiPayload, USD_FOMC: fomcPayload };
-  const TAB_ORDER = ["USD_NFP", "USD_CPI", "USD_PPI", "USD_FOMC", "GBP_CPI", "GBP_JOBS", "EUR_CPI", "EUR_PMI"];
+  const TAB_ORDER = ["USD_NFP", "USD_CPI", "USD_PPI", "USD_FOMC", "GBP_CPI", "GBP_JOBS_V3", "EUR_CPI", "EUR_PMI"];
   const MOD_NAME = { USD_NFP: "NFP", USD_CPI: "CPI", USD_PPI: "PPI", USD_FOMC: "FOMC" };
   const TAB_ID = { USD_NFP: "NFP", USD_CPI: "CPI", USD_PPI: "PPI", USD_FOMC: "FOMC" };
   const tabIdFor = key => TAB_ID[key] || key.replace("_", "");
@@ -3864,6 +4712,452 @@ def index():
     </div>`;
   }
 
+  // ==========================================================================
+  // UK LABOUR MARKET TERMINAL
+  //   MODULE 1 — Pre-News v3 Spike Predictor. The browser mirrors the server
+  //              engine (/api/predict-gbp-jobs-v3) so the gauge moves on every
+  //              keystroke; the two are compared on each sync so they cannot drift.
+  //   MODULE 2 — Post-News Trader Execution Matrix. Shell only: the decoder can
+  //              not be calibrated until the FX + consensus data exists (see the
+  //              audit block). Every unset parameter is shown as MISSING, never
+  //              as a guess.
+  // ==========================================================================
+  const V3_W = { dmp: 0.20, sal: 0.15, perm: 0.25, pmi: 0.20, paye: 0.12, adzuna: 0.08 };
+  const V3_ORDER = ["dmp", "sal", "perm", "pmi", "paye", "adzuna"];
+  const V3_LABEL = {
+    dmp: "BoE DMP wage expectations", sal: "REC starting salaries", perm: "REC permanent placements",
+    pmi: "UK PMI employment", paye: "HMRC PAYE payrolls change", adzuna: "Adzuna job ads"
+  };
+  const V3_WATCH = 8;
+  const V3_DEFAULTS = { dmp_curr: 4.2, dmp_prev: 4.2, rec_sal_curr: 53.5, rec_sal_prev: 52.0,
+                        rec_perm_curr: 48.5, rec_perm_prev: 47.0, pmi_curr: 50.8, pmi_prev: 49.9,
+                        paye_k: 15, adzuna_pct: 1.2, perm_kink_tol: 0.5, perm_level_tol: 0.5 };
+  const V3_STATE = { live: null, locked: null, matrix: false, dryRan: false, parity: "", server: null };
+
+  function v3c(v) { return Math.max(-100, Math.min(100, v)); }
+
+  // Mirror of _v3_perm_multiplier: 5x below the band, 10x above it, linear inside.
+  // tol = 0 reproduces the raw spec step at |delta| = 3.0.
+  function v3PermMult(delta, tol) {
+    const a = Math.abs(delta), lo = 3 - tol, hi = 3 + tol;
+    if (!(tol > 0) || a <= lo) { return { m: a >= 3 ? 10 : 5, state: a >= 3 ? "above" : "below" }; }
+    if (a >= hi) { return { m: 10, state: "above" }; }
+    return { m: 5 + 5 * ((a - lo) / (hi - lo)), state: "band" };
+  }
+
+  function v3Engine(i) {
+    const permDelta = i.rec_perm_curr - i.rec_perm_prev;
+    const kinkTol = Math.max(0, Math.min(2, isFinite(i.perm_kink_tol) ? i.perm_kink_tol : 0.5));
+    const levelTol = Math.max(0, Math.min(2, isFinite(i.perm_level_tol) ? i.perm_level_tol : 0.5));
+    const pm = v3PermMult(permDelta, kinkTol);
+    const permMult = pm.m;
+    const s = {
+      dmp: v3c((i.dmp_curr - 3.5) * 40 + (i.dmp_curr - i.dmp_prev) * 20),
+      sal: v3c((i.rec_sal_curr - 50) * 10 + (i.rec_sal_curr - i.rec_sal_prev) * 5),
+      perm: v3c((i.rec_perm_curr - 50) * 10 + permDelta * permMult),
+      pmi: v3c((i.pmi_curr - 50) * 15 + (i.pmi_curr - i.pmi_prev) * 10),
+      paye: v3c((i.paye_k / 30.0) * 100),
+      adzuna: v3c((i.adzuna_pct / 5.0) * 100)
+    };
+    const composite = V3_ORDER.reduce((a, k) => a + s[k] * V3_W[k], 0);
+    const pos = V3_ORDER.filter(k => s[k] > 0).length;
+    const neg = V3_ORDER.filter(k => s[k] < 0).length;
+    const wage = (i.dmp_curr >= 5.0 && i.rec_sal_curr >= 57.0 && composite > 0);
+    const nearFifty = (levelTol > 0) && (Math.abs(i.rec_perm_curr - 50) < levelTol);
+    const div = nearFifty ? (i.paye_k !== 0)
+                          : ((i.paye_k > 0 && i.rec_perm_curr < 50) || (i.paye_k < 0 && i.rec_perm_curr > 50));
+    const divState = nearFifty ? "band" : "clear";
+    const vol = (i.paye_k <= -20 && i.rec_perm_curr <= 48) || (i.paye_k >= 20 && i.rec_perm_curr >= 52);
+    const unan = (pos >= 5 || neg >= 5);
+    let gate, rule, code;
+    if (wage) { gate = 22; rule = "Wage Override (±22)"; code = "WAGE_OVERRIDE"; }
+    else if (div) { gate = 32; rule = "LFS Divergence Filter (±32)"; code = "DIVERGENCE"; }
+    else if (vol || unan) { gate = 20; rule = "Confirmed Breadth/Volume (±20)"; code = "BREADTH"; }
+    else { gate = 25; rule = "Standard Baseline Gate (±25)"; code = "BASELINE"; }
+    let verdict, vcode;
+    if (composite >= gate) { verdict = "UPSIDE SPIKE"; vcode = "UPSIDE"; }
+    else if (composite <= -gate) { verdict = "DOWNSIDE SPIKE"; vcode = "DOWNSIDE"; }
+    else { verdict = "NO TRADE"; vcode = "NO_TRADE"; }
+    const headroom = gate - Math.abs(composite);
+    const watch = (vcode === "NO_TRADE" && headroom <= V3_WATCH);
+    const breakdown = V3_ORDER.map(k => ({ key: k, label: V3_LABEL[k], score: s[k], weight: V3_W[k], contribution: s[k] * V3_W[k] }));
+    const notes = [];
+    if (div) notes.push("PAYE " + (i.paye_k >= 0 ? "+" : "") + i.paye_k + "K against placements " + i.rec_perm_curr.toFixed(1)
+      + ": the LFS Divergence Filter outranks every other rule and holds the gate open at ±32.");
+    if (div && unan) notes.push("Breadth is " + Math.max(pos, neg) + "-of-6, which would normally give ±20, but the divergence rule sits higher in the priority order.");
+    if (pm.state === "band") notes.push("Placements momentum " + (permDelta >= 0 ? "+" : "") + permDelta.toFixed(2)
+      + " is inside the ±" + kinkTol.toFixed(2) + " tolerance band, so the multiplier is blended at " + permMult.toFixed(2) + "x instead of stepping between 5x and 10x.");
+    if (kinkTol <= 0 && Math.abs(Math.abs(permDelta) - 3.0) < 0.15) notes.push("Tolerance band is off: the multiplier is a hard step at |Δ| = 3.0, so s_perm can jump about 15 points on a 0.05 input move.");
+    if (divState === "band") notes.push("Placements " + i.rec_perm_curr.toFixed(2) + " sit inside the ±" + levelTol.toFixed(2)
+      + " band around 50, so the PAYE split is unresolved rather than agreed: the gate stays wide at ±" + gate + ".");
+    if (levelTol <= 0 && Math.abs(i.rec_perm_curr - 50) < 0.15) notes.push("Boundary band is off: at exactly 50.00 the divergence test stops firing and the gate can drop from ±32 to ±20.");
+    if (watch) notes.push("Composite is " + headroom.toFixed(2) + " inside the gate: a lean exists, a signal does not.");
+    return { composite: composite, gate: gate, gate_rule: rule, gate_code: code, verdict: verdict, verdict_code: vcode,
+             subscores: s, breakdown: breakdown, pos_count: pos, neg_count: neg, headroom: headroom, watch: watch,
+             notes: notes, flags: { wage_override: wage, divergence: div, vol_confirmed: vol, unanimous: unan,
+             perm_delta: permDelta, perm_multiplier: permMult, kink_tolerance: kinkTol, kink_state: pm.state,
+             level_tolerance: levelTol, divergence_state: divState } };
+  }
+
+  function v3ReadInputs() {
+    const out = {};
+    MODS.GBP_JOBS_V3.fields.forEach(f => {
+      const el = document.getElementById("gbpj3_" + f[0]);
+      const v = el ? Number(el.value) : NaN;
+      out[f[0]] = (isFinite(v) && el && String(el.value).trim() !== "") ? v : V3_DEFAULTS[f[0]];
+    });
+    return out;
+  }
+
+  function v3Pos(v) { return Math.max(0, Math.min(100, (v + 100) / 2)); }
+
+  function v3GaugeHtml(composite, gate) {
+    const bandL = v3Pos(-gate), bandW = v3Pos(gate) - bandL;
+    const np = v3Pos(Math.max(-100, Math.min(100, composite)));
+    const lbl = (v, t) => `<span style="left:${v3Pos(v)}%;">${t}</span>`;
+    return `<div class="v3-track"></div>
+      <div class="v3-band" style="left:${bandL}%; width:${bandW}%;"></div>
+      <div class="v3-needle" style="left:${np}%;"><span>${composite >= 0 ? "+" : ""}${composite.toFixed(2)}</span></div>
+      <div class="v3-scale">${lbl(-100, "−100")}${lbl(-gate, "−" + gate)}${lbl(0, "0")}${lbl(gate, "+" + gate)}${lbl(100, "+100")}</div>`;
+  }
+
+  function v3MiniBar(sc) {
+    return `<div class="mini-bar"><i class="${sc >= 0 ? "pos" : "neg"}" style="width:${Math.min(50, Math.abs(sc) / 2)}%"></i></div>`;
+  }
+
+  function v3BreakdownHtml(res) {
+    const rows = res.breakdown.map(b => {
+      const cls = b.score > 0 ? "bull" : b.score < 0 ? "bear" : "neut";
+      return `<tr>
+        <td>${esc(b.label)}</td>
+        <td class="num ${cls}">${b.score >= 0 ? "+" : ""}${b.score.toFixed(1)}</td>
+        <td>${v3MiniBar(b.score)}</td>
+        <td class="num">${Math.round(b.weight * 100)}%</td>
+        <td class="num ${cls}">${b.contribution >= 0 ? "+" : ""}${b.contribution.toFixed(2)}</td>
+      </tr>`;
+    }).join("");
+    const cls = res.composite > 0 ? "bull" : res.composite < 0 ? "bear" : "neut";
+    return `<div class="m2-scroll"><table class="v3-table">
+      <thead><tr><th>Indicator</th><th class="num">Normalised (−100…+100)</th><th></th><th class="num">Weight</th><th class="num">Contribution</th></tr></thead>
+      <tbody>${rows}
+      <tr><td><strong>Composite</strong></td><td class="num">—</td><td></td><td class="num">100%</td>
+      <td class="num ${cls}"><strong>${res.composite >= 0 ? "+" : ""}${res.composite.toFixed(2)}</strong></td></tr>
+      <tr><td colspan="5" style="border-bottom:none; color:var(--muted); font-size:0.75rem;">
+        Gate in force: <strong>${esc(res.gate_rule)}</strong> · breadth ${res.pos_count} positive / ${res.neg_count} negative ·
+        ${res.headroom >= 0 ? "inside the gate by " + res.headroom.toFixed(2) : "breach by " + Math.abs(res.headroom).toFixed(2)}</td></tr>
+      </tbody></table></div>`;
+  }
+
+  function v3Paint(res) {
+    if (!res) return;
+    const set = (id, html) => { const el = document.getElementById(id); if (el) el.innerHTML = html; };
+    const vCls = res.verdict_code === "UPSIDE" ? "badge-up" : res.verdict_code === "DOWNSIDE" ? "badge-down" : "badge-flat";
+    set("gbpj3Comp", `<div class="k">Composite score</div><div class="v" style="color:${res.composite > 0 ? "var(--green)" : res.composite < 0 ? "var(--red)" : "var(--amber)"}">${res.composite >= 0 ? "+" : ""}${res.composite.toFixed(2)}</div><div class="s">${res.headroom >= 0 ? res.headroom.toFixed(2) + " inside the gate" : "past the gate by " + Math.abs(res.headroom).toFixed(2)}</div>`);
+    set("gbpj3Gate", `<div class="k">Active gate</div><div class="v">±${res.gate}</div><div class="s">${res.gate_code.replace("_", " ").toLowerCase()}</div>`);
+    const shortRule = { WAGE_OVERRIDE: "Wage Override", DIVERGENCE: "LFS Divergence Filter", BREADTH: "Confirmed Breadth", BASELINE: "Standard Baseline" }[res.gate_code] || res.gate_rule;
+    set("gbpj3Rule", `<div class="k">Triggered rule</div><div class="v" style="font-size:1.05rem; line-height:1.35;">${esc(shortRule)}</div><div class="s">±${res.gate} · breadth ${res.pos_count}+ / ${res.neg_count}−</div>`);
+    set("gbpj3Verdict", `<div class="k">Pre-news verdict</div><div class="v"><span class="v3-badge ${vCls}">${esc(res.verdict)}</span></div><div class="s">${res.watch ? `<span class="untested">WATCH — ${res.headroom.toFixed(1)} from gate</span>` : "gate is the only trigger"}</div>`);
+    set("gbpj3Gauge", v3GaugeHtml(res.composite, res.gate));
+    set("gbpj3Body", v3BreakdownHtml(res));
+    set("gbpj3Notes", res.notes.length
+      ? res.notes.map(n => `<div class="m2-banner info" style="margin-bottom:0.5rem;">${esc(n)}</div>`).join("")
+      : `<div class="m2-banner info" style="margin-bottom:0.5rem;">No edge-case flags: the gate in force is the plain rule for this configuration.</div>`);
+    set("gbpj3Parity", esc(V3_STATE.parity));
+    set("gbpj3Tier", esc(res.verdict_code !== "NO_TRADE" ? "SIGNAL IN FORCE" : ""));
+  }
+
+  function v3Live() {
+    const res = v3Engine(v3ReadInputs());
+    V3_STATE.live = res;
+    v3Paint(res);
+    mod2Render();
+  }
+
+  function v3Defaults() {
+    MODS.GBP_JOBS_V3.fields.forEach(f => {
+      const el = document.getElementById("gbpj3_" + f[0]);
+      if (el) el.value = V3_DEFAULTS[f[0]];
+    });
+    v3Live();
+    v3Sync(false);
+  }
+
+  async function v3Sync(force) {
+    const inp = v3ReadInputs();
+    const local = v3Engine(inp);
+    V3_STATE.live = local;
+    const { ok, data } = await apiPost(MODS.GBP_JOBS_V3.api, { user_email: currentUser ? currentUser.email : "", ...inp });
+    if (!ok) {
+      V3_STATE.server = null;
+      V3_STATE.parity = "Server copy not reachable from this session (" + errText(data) + "). Gauge is running on the browser mirror of the same formula.";
+    } else {
+      V3_STATE.server = data;
+      const dC = Math.abs((data.composite || 0) - local.composite);
+      const dG = Math.abs((data.gate || 0) - local.gate);
+      V3_STATE.parity = (dC < 0.005 && dG < 0.005)
+        ? "Server and browser engines agree on this input set (composite and gate identical to the cent)."
+        : "WARNING — server/browser disagreement: composite Δ " + dC.toFixed(3) + ", gate Δ " + dG.toFixed(3) + ". Trust the server and report this.";
+    }
+    v3Paint(V3_STATE.server || local);
+    mod2Render();
+  }
+
+  function v3Pass() {
+    V3_STATE.locked = { res: V3_STATE.live, ts: new Date() };
+    mod2Render();
+    const el = document.getElementById("mod2Card");
+    if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function v3Arrow(d) { return d === "UPSIDE" ? "▲" : d === "DOWNSIDE" ? "▼" : "■"; }
+
+  // ---------------------------- MODULE 2 ----------------------------------
+  const M2_GROUPS = [
+    { g: "ur",   label: "Unemployment rate (3M)",            unit: "%", step: 0.1, sign: -1, noise: 0.1, f: 4.4, a: 4.5, w: 0.10 },
+    { g: "ahe",  label: "AWE incl. bonus (3M YoY)",          unit: "%", step: 0.1, sign: 1,  noise: 0.1, f: 4.6, a: 4.8, w: 0.15 },
+    { g: "reg",  label: "AWE regular pay ex-bonus (3M YoY)", unit: "%", step: 0.1, sign: 1,  noise: 0.1, f: 4.9, a: 5.0, w: 0.30 },
+    { g: "priv", label: "Private regular pay (3M YoY)",      unit: "%", step: 0.1, sign: 1,  noise: 0.1, f: 5.0, a: 5.1, w: 0.20 },
+    { g: "emp",  label: "Employment change (3M)",            unit: "K", step: 1,   sign: 1,  noise: 10,  f: 20,  a: 35,  w: 0.15 },
+    { g: "cc",   label: "Claimant count change",             unit: "K", step: 1,   sign: -1, noise: 10,  f: 15,  a: 10,  w: 0.05 },
+    { g: "rev",  label: "Revision to prior payrolls",        unit: "K", step: 1,   sign: 1,  noise: 10,  f: null, a: 0,  w: 0.05, single: true }
+  ];
+
+  const M2_AUDIT = [
+    ["A", "Which numbers move the pound", "Correlation of each surprise with the 15-minute GBP/USD move", "MISSING", "n = 0 / 36"],
+    ["B", "What counts as a real surprise", "Noise width per field: spread + 5 pips in price terms", "MISSING", "n = 0 / 36"],
+    ["C", "Do traps exist", "Headline vs pay divergence, then reclaim of the 06:59 level", "MISSING", "n = 0 / 36"],
+    ["D", "Is the first move reliable", "Continuation of the first 1-minute bar over 15 minutes", "MISSING", "n = 0 / 36"],
+    ["E", "Entry timing", "07:01 close vs 38.2–50% pullback vs 5-minute close, after spreads", "MISSING", "n = 0 / 36"],
+    ["F", "Stops and targets", "8 / 12 / 15 / 20 pip stops, 1R / 1.5R / 1.8R, 15 and 20 minute exits", "MISSING", "n = 0 / 36"],
+    ["G", "Does the pre-news signal help", "Agreement vs contradiction with the v3 verdict", "MISSING", "n = 0 / 36"],
+    ["H", "Pair filters", "GBP/JPY vs falling equities, EUR/GBP on Eurozone news days", "MISSING", "n = 0 / 36"]
+  ];
+
+  const M2_PARAMS = [
+    ["θ base decision threshold", "Gate on the weighted z-score before a trade is allowed", "Q B + F"],
+    ["noise zones (7 fields)", "Denominator of every z-score", "Q B"],
+    ["weights (7 fields)", "Score weights, currently priors, not measured", "Q A"],
+    ["λ NO-TRADE multiplier", "Bigger edge demanded when the pre-news read was NO TRADE", "Q G"],
+    ["μ contradiction rule", "Stand aside vs stricter threshold when the print fights the pre-news signal", "Q G"],
+    ["N, X no-extension window", "Minutes and pips that define failed follow-through", "Q D"],
+    ["Y reclaim distance", "Pips through the 06:59 close that confirm a trap", "Q C"],
+    ["entry trigger", "07:01 close vs pullback vs 5-minute close", "Q E"],
+    ["stop / target / time exit", "Risk block per pair", "Q F"],
+    ["execution filter", "Expected edge must clear spread plus slippage", "spread data"],
+    ["pair filters", "GBP/JPY equities filter, EUR/GBP Eurozone blackout", "Q H"]
+  ];
+
+  const M2_DATA_NOTE = "Workbook delivered: 36 release rows (Dec 2023 – Nov 2026), split 18 in-sample / 18 out-of-sample. Populated: release date and time, unemployment actual and previous, AWE total actual and previous, AWE regular actual and previous. MISSING in every row: consensus forecast, 1-minute FX prices, 07:00–07:05 spreads, private regular pay, claimant count, revisions, equity and Eurozone flags. No surprise can be computed without a forecast and no outcome can be measured without a price, so 0 of the 36 rows are usable.";
+
+  const M2_NEEDED = [
+    "Tick or 1-minute bid/ask export for GBP/USD, GBP/JPY and EUR/GBP, 06:55–08:00 UK time, on the 36 release dates (Dukascopy, HistData or a broker export).",
+    "Calendar CSV with Actual, Forecast and Revised Previous for unemployment, AWE total, AWE regular, employment change and claimant count (ForexFactory, Investing.com or Bloomberg).",
+    "07:00–07:05 spreads per pair, plus same-day flags for BoE decisions, UK CPI and Eurozone releases."
+  ];
+
+  function m2Signal() { return V3_STATE.locked ? V3_STATE.locked.res : V3_STATE.live; }
+
+  function m2ContextHtml() {
+    const sig = m2Signal();
+    if (!sig) return "";
+    const locked = V3_STATE.locked;
+    const cls = sig.verdict_code === "UPSIDE" ? "badge-up" : sig.verdict_code === "DOWNSIDE" ? "badge-down" : "badge-flat";
+    return `<div class="m2-banner ${sig.verdict_code === "NO_TRADE" ? "info" : "ok"}">
+      <strong>Pre-news read: ${v3Arrow(sig.verdict_code)} ${esc(sig.verdict)}</strong> — composite ${sig.composite >= 0 ? "+" : ""}${sig.composite.toFixed(2)}
+      against a ±${sig.gate} gate (${esc(sig.gate_rule)}).
+      ${locked ? "Committed " + locked.ts.toLocaleTimeString() + " and frozen for this release." : "Following Module 1 live — press Pass signal to freeze it for the release."}
+      ${sig.verdict_code === "NO_TRADE" ? " Because the pre-news read is NO TRADE, the post-news decoder must demand a larger edge before a ticket is issued." : ""}
+      <span class="v3-badge ${cls}" style="margin-left:0.4rem;">${esc(sig.verdict_code.replace("_", " "))}</span></div>`;
+  }
+
+  function m2InputsHtml(vals) {
+    const rows = M2_GROUPS.map(gr => {
+      if (gr.single) {
+        return `<div style="grid-column: span 2; margin-bottom:0.55rem;">
+          <label>${esc(gr.label)} (${gr.unit}) — print only</label>
+          <input type="number" id="m2f_${gr.g}_a" step="${gr.step}" placeholder="actual revision" value="${gr.a}" /></div>`;
+      }
+      return `<div style="margin-bottom:0.55rem;">
+        <label>${esc(gr.label)} (${gr.unit})</label>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.4rem;">
+          <input type="number" id="m2f_${gr.g}_f" step="${gr.step}" placeholder="forecast" value="${gr.f}" />
+          <input type="number" id="m2f_${gr.g}_a" step="${gr.step}" placeholder="actual" value="${gr.a}" />
+        </div></div>`;
+    }).join("");
+    return `<p style="font-size:0.75rem; color:var(--muted); margin-bottom:0.6rem;">Left box = forecast, right box = actual. Sign conventions are applied automatically: unemployment and claimant count are inverted, earnings and employment are not.</p>
+      <div class="m2-grid">${rows}</div>`;
+  }
+
+  function m2DryRun() {
+    const out = document.getElementById("m2DryOut");
+    if (!out) return;
+    const rows = [];
+    let sum = 0, wsum = 0;
+    M2_GROUPS.forEach(gr => {
+      const aEl = document.getElementById("m2f_" + gr.g + "_a");
+      if (!aEl) return;
+      const a = Number(aEl.value);
+      if (String(aEl.value).trim() === "" || !isFinite(a)) return;
+      let f = 0;
+      if (!gr.single) {
+        const fEl = document.getElementById("m2f_" + gr.g + "_f");
+        f = Number(fEl ? fEl.value : 0);
+        if (!fEl || String(fEl.value).trim() === "" || !isFinite(f)) return;
+      }
+      const surprise = gr.sign * (a - f);
+      const z = Math.max(-3, Math.min(3, surprise / gr.noise));
+      sum += z * gr.w; wsum += gr.w;
+      rows.push({ label: gr.label, f: gr.single ? null : f, a: a, surprise: surprise, noise: gr.noise, z: z, w: gr.w, wc: z * gr.w });
+    });
+    if (!rows.length) { out.innerHTML = `<div class="m2-banner block">Enter at least one forecast and actual pair.</div>`; return; }
+    const score = wsum > 0 ? sum / wsum : 0;
+    const body = rows.map(r => {
+      const cls = r.z > 0 ? "bull" : r.z < 0 ? "bear" : "neut";
+      return `<tr><td>${esc(r.label)}</td>
+        <td class="num">${r.f === null ? "—" : r.f}</td><td class="num">${r.a}</td>
+        <td class="num ${cls}">${r.surprise >= 0 ? "+" : ""}${r.surprise.toFixed(1)}</td>
+        <td class="num" style="color:var(--muted)">±${r.noise}</td>
+        <td class="num ${cls}">${r.z >= 0 ? "+" : ""}${r.z.toFixed(2)}</td>
+        <td class="num">${Math.round(r.w * 100)}%</td>
+        <td class="num ${cls}">${r.wc >= 0 ? "+" : ""}${r.wc.toFixed(3)}</td></tr>`;
+    }).join("");
+    const dir = score > 0.02 ? "BULLISH GBP" : score < -0.02 ? "BEARISH GBP" : "NEUTRAL";
+    out.innerHTML = `<div class="m2-banner info"><strong>Structural dry-run only.</strong> Signed surprises and z-scores below use placeholder noise zones (±0.1pp for rates, ±10K for levels) and prior weights.
+      Direction preview: <strong>${dir}</strong> at ${score >= 0 ? "+" : ""}${score.toFixed(2)} z-units. No ticket is issued from this table.</div>
+      <div class="m2-scroll"><table class="v3-table">
+        <thead><tr><th>Field</th><th class="num">Fcst</th><th class="num">Actual</th><th class="num">Signed surprise</th><th class="num">Noise</th><th class="num">z</th><th class="num">Weight</th><th class="num">Weighted</th></tr></thead>
+        <tbody>${body}</tbody></table></div>`;
+  }
+
+  function m2RenderBody() {
+    const host = document.getElementById("mod2Body");
+    if (!host) return;
+    const vals = {};
+    document.querySelectorAll("[id^='m2f_']").forEach(el => { vals[el.id] = el.value; });
+    const sig = m2Signal();
+    if (!V3_STATE.matrix) {
+      host.innerHTML = `<div class="m2-empty">
+        <div style="font-size:1.6rem; margin-bottom:0.4rem;">🗂️</div>
+        <p><strong>Matrix not loaded.</strong> Module 2 reads the Module 1 signal automatically: composite, gate and verdict.
+        Loading the matrix opens the ONS print fields and the rule slot for this release.</p>
+        <button class="btn" onclick="V3_STATE.matrix = true; mod2Render();">Load Post-News Matrix</button>
+        <p style="margin-top:0.75rem; font-size:0.75rem;">${sig ? "Signal on the wire: " + esc(sig.verdict) + " (" + (sig.composite >= 0 ? "+" : "") + sig.composite.toFixed(2) + " vs ±" + sig.gate + ")." : "No pre-news signal yet — set the Module 1 inputs first."}</p>
+      </div>`;
+      return;
+    }
+    host.innerHTML = `
+      ${m2ContextHtml()}
+      <div class="m2-banner block"><strong>Decoder v2 is not armed.</strong> None of the 11 parameters below has a measured value:
+        the research workbook delivered 0 of 36 usable rows. The fields and the rule slots are live so you can see the shape of the
+        decision, but the trade ticket stays withheld until the FX and consensus data lands.</div>
+      <div class="m2-grid" style="grid-template-columns:1fr;">
+        ${m2InputsHtml(vals)}
+      </div>
+      <div class="v3-inline-actions">
+        <button class="btn-outline" onclick="m2DryRun()">Run structural dry-run</button>
+        <button class="btn-outline" onclick="V3_STATE.dryRan = false; document.getElementById('m2DryOut').innerHTML = '';">Clear dry-run</button>
+        <button class="btn-outline" onclick="v3Pass()">Re-lock current signal</button>
+      </div>
+      <div id="m2DryOut" style="margin-top:0.9rem;"></div>
+
+      <div class="m2-sec">
+        <h3>Trade ticket — withheld</h3>
+        <div class="m2-ticket">
+          <h4>No ticket will be issued from this release</h4>
+          <p>Entry, stop, target, size and pair filters are all functions of parameters that are MISSING. Issuing a ticket here would be a guess dressed as a plan.</p>
+        </div>
+      </div>
+
+      <div class="m2-sec">
+        <h3>Parameter slots — what fills each one</h3>
+        <div class="m2-scroll"><table class="v3-table">
+          <thead><tr><th>Parameter</th><th>What it does</th><th>Set by</th><th>Status</th></tr></thead>
+          <tbody>${M2_PARAMS.map(p => `<tr><td>${esc(p[0])}</td><td style="color:var(--muted)">${esc(p[1])}</td><td>${esc(p[2])}</td><td><span class="missing">MISSING</span></td></tr>`).join("")}</tbody>
+        </table></div>
+      </div>
+
+      <div class="m2-sec">
+        <h3>Research audit — backtest answers received</h3>
+        <div class="m2-scroll"><table class="v3-table">
+          <thead><tr><th>Q</th><th>Question</th><th>Test required</th><th>Status</th><th>Sample</th></tr></thead>
+          <tbody>${M2_AUDIT.map(a => `<tr><td>${esc(a[0])}</td><td>${esc(a[1])}</td><td style="color:var(--muted)">${esc(a[2])}</td>
+            <td><span class="missing">${esc(a[3])}</span></td><td class="num">${esc(a[4])}</td></tr>`).join("")}</tbody>
+        </table></div>
+        <div class="m2-banner info" style="margin-top:0.75rem;">${esc(M2_DATA_NOTE)}</div>
+        <p style="font-size:0.78rem; color:var(--muted); margin-bottom:0.35rem;"><strong style="color:var(--gold-bright);">Two files turn this module on:</strong></p>
+        <ul style="font-size:0.78rem; color:var(--muted); margin-left:1.1rem;">
+          ${M2_NEEDED.map(n => `<li style="margin-bottom:0.3rem;">${esc(n)}</li>`).join("")}
+        </ul>
+      </div>`;
+    document.querySelectorAll("[id^='m2f_']").forEach(el => { if (vals[el.id] !== undefined) el.value = vals[el.id]; });
+    if (V3_STATE.dryRan) m2DryRun();
+  }
+
+  function mod2Render() {
+    m2RenderBody();
+    const badge = document.getElementById("mod2Badge");
+    if (badge) {
+      const sig = m2Signal();
+      if (!V3_STATE.matrix) { badge.className = "pill neut"; badge.innerText = "EMPTY"; }
+      else if (V3_STATE.locked) { badge.className = "pill live"; badge.innerText = "SIGNAL LOCKED"; }
+      else if (sig) { badge.className = "pill up"; badge.innerText = "READING MODULE 1 LIVE"; }
+      else { badge.className = "pill neut"; badge.innerText = "NO SIGNAL"; }
+    }
+  }
+
+  function buildJobsV3View() {
+    const inputs = MODS.GBP_JOBS_V3.fields.map(f =>
+      `<div><label>${esc(f[1])}</label><input type="number" id="gbpj3_${f[0]}" value="${f[2]}" step="${f[3]}" oninput="v3Live()" /></div>`).join("");
+    return `<div id="view${tabIdFor("GBP_JOBS_V3")}" class="grid hidden">
+      <div class="card desk-only">
+        <h2><span>MODULE 1 — Pre-News v3 Spike Predictor</span><span class="v3-tier">🇬🇧 GBP · spec-locked v3</span></h2>
+        <p class="v3-sub">Six leading proxies, weights fixed at 20 / 15 / 25 / 20 / 12 / 8. Every field recalculates on keystroke. Defaults reproduce the reference case: composite +22.22 against a ±32 divergence gate, verdict NO TRADE. This tab replaces the V2 model; the two tolerance controls below are the only departures from the raw spec.</p>
+        <div class="form-grid">${inputs}</div>
+        <div class="v3-inline-actions">
+          <button class="btn-outline" onclick="v3Defaults()">Reset to test defaults</button>
+          <button class="btn-outline" onclick="v3Sync(true)">Re-check against server</button>
+        </div>
+        <p id="gbpj3Parity" class="v3-parity"></p>
+        <details class="v3-notes">
+          <summary>Tolerance bands, and how v3 differs from the retired V2</summary>
+          <ul>
+            <li><strong>Kink band (±0.5):</strong> the raw spec steps the placements multiplier 5x → 10x at |Δ| = 3.0, worth about 3.8 composite points on a 0.01 input move. Inside the band the multiplier ramps linearly, so the score is continuous. Set the width to 0 to restore the exact step.</li>
+            <li><strong>Boundary band (±0.5):</strong> the divergence test compares PAYE with placements' side of 50. Inside the band the side is unresolved, so the split is never read as agreement and the wide ±32 gate holds. Set the width to 0 to restore the exact test.</li>
+            <li>Both bands leave the calibrated regimes untouched: 5x still applies below |Δ| = 2.5, 10x above 3.5, and the divergence test is unchanged outside 49.5–50.5.</li>
+            <li>Retired V2 differences: V2 squashed each proxy to ±1 before weighting, read placements against last month rather than the 50 level, and ran two gate rules instead of four.</li>
+          </ul>
+        </details>
+      </div>
+      <div>
+        <div class="card desk-only" id="gbpj3DeskCard">
+          <h2><span>MODULE 1 — Composite, Gate &amp; Verdict</span><span id="gbpj3Tier" class="v3-tier"></span></h2>
+          <div class="v3-kpi">
+            <div class="v3-tile" id="gbpj3Comp"></div>
+            <div class="v3-tile" id="gbpj3Gate"></div>
+            <div class="v3-tile" id="gbpj3Rule"></div>
+            <div class="v3-tile" id="gbpj3Verdict"></div>
+          </div>
+          <div class="v3-gauge" id="gbpj3Gauge"></div>
+          <div id="gbpj3Notes"></div>
+          <div id="gbpj3Body"></div>
+          <button class="btn" style="width:100%; margin-top:0.9rem;" onclick="v3Pass()">Pass signal to Module 2 →</button>
+        </div>
+        <div class="card desk-only m2-card" id="mod2Card">
+          <h2><span>MODULE 2 — Post-News Trader Execution Matrix</span><span id="mod2Badge" class="pill neut">EMPTY</span></h2>
+          <div id="mod2Body"></div>
+        </div>
+        <div class="card desk-only" id="gbpj3ScheduleHost"></div>
+        <div class="card">
+          <h2><span>⚡ Post-Release Action Decoder</span><span class="v3-tier">installed · uncalibrated</span></h2>
+          <p style="font-size:0.8rem; color:var(--muted); margin-bottom:0.85rem;">The model behind this decoder is retired; the decoder itself is the one already in service on release days.
+          It reads unemployment and headline earnings only, counts a surprise at a fixed 0.1 and returns one of five states with no stop, target or size.
+          Module 2 above replaces it once the calibration data lands.</p>
+          ${decoderFormHtml("GBP_JOBS", "dec_gbpjobs", null)}
+        </div>
+      </div>
+    </div>`;
+  }
+
   function genericPayload(key) {
     const m = MODS[key];
     const out = {};
@@ -3903,6 +5197,7 @@ def index():
   function renderGeneric(key, d) {
     const m = MODS[key];
     const p = m.prefix;
+    if (!document.getElementById(p + "Bias")) return;
     if (key === "EUR_CPI" && d.proxy_rounded !== undefined) {
       const up = d.bias === "HOTTER", down = d.bias === "COOLER";
       const el = document.getElementById(p + "Bias");
@@ -3947,6 +5242,7 @@ def index():
         loadedTab[k] = true;
         if (k === "USD_PPI") { ppiLoaded = true; calcPPI(); }
         else if (k === "USD_FOMC") { fomcLoaded = true; calcFOMC(); }
+        else if (k === "GBP_JOBS_V3") { v3Sync(false); }
         else if (MODS[k].fields) { calcGeneric(k); }
       }
     });
@@ -3981,6 +5277,7 @@ def index():
   }
 
   function payloadForKey(key) {
+    if (key === "GBP_JOBS") return v3ReadInputs();   // V2 model retired: the desk publishes the v3 read
     return USD_PAYLOAD[key] ? USD_PAYLOAD[key]() : genericPayload(key);
   }
 
@@ -3999,7 +5296,8 @@ def index():
       let result = {};
       if (released) {
         inputs = payloadForKey(key);
-        const calc = await apiPost(m.api, { user_email: currentUser.email, ...inputs });
+        const calcApi = (key === "GBP_JOBS") ? MODS.GBP_JOBS_V3.api : m.api;
+        const calc = await apiPost(calcApi, { user_email: currentUser.email, ...inputs });
         if (!calc.ok) { status.innerText = "Could not calculate: " + errText(calc.data); return; }
         result = calc.data;
         if (key === "USD_NFP") renderForecast("nfp", calc.data, true);
@@ -4147,6 +5445,7 @@ def index():
   }
 
   function eventCardHtml(ev) {
+    if (ev.locked) return lockedCardHtml(ev);
     if (!ev.released || !ev.result) return teaserCardHtml(ev);
     const key = `${ev.currency}_${ev.module}`;
     const m = MODS[key];
@@ -4179,12 +5478,14 @@ def index():
 
   async function loadClientQueue(force) {
     const box = document.getElementById("clientQueueBody");
+    if (PAY_REF && !payHandled) { payHandled = true; handlePayReturn(); }
     try {
       const res = await fetch("/api/next-events", { cache: "no-store" });
       if (!res.ok) throw new Error("bad response");
       const data = await res.json();
+      if (data.payments) payInfo = data.payments;
       serverOffset = Date.parse(data.server_time) - Date.now();
-      const sig = (data.events || []).map(e => e.event_id + "|" + e.updated_at + "|" + e.release_utc + "|" + e.released + "|" + (e.decoded ? e.decoded.updated_at : "")).join(",");
+      const sig = (data.events || []).map(e => e.event_id + "|" + e.updated_at + "|" + e.release_utc + "|" + e.released + "|" + (e.locked ? "L" : "U") + "|" + (e.decoded ? e.decoded.updated_at : "")).join(",");
       if (!force && sig === lastQueueSig) { tickCountdowns(); return; }
       lastQueueSig = sig;
       if (!data.events.length) {
@@ -4630,23 +5931,197 @@ def index():
     loadRelLedger();
   }
 
+
+  // ==========================================================================
+  // Payments: locked event card, Paystack return handling (clients) + Payments & Access card (admin)
+  // ==========================================================================
+  const PAY_PARAMS = new URLSearchParams(location.search);
+  const PAY_REF = PAY_PARAMS.get("reference") || PAY_PARAMS.get("trxref") || "";
+  let payHandled = false;
+  let payInfo = { enabled: false, price_kes: 400 };
+
+  function lockedCardHtml(ev) {
+    const price = Number(payInfo.price_kes).toLocaleString();
+    return `<div class="card" style="border-color:var(--gold); text-align:center;">
+      <div class="dept-tag" style="margin-bottom:0.4rem;">Next Event</div>
+      <h2 style="justify-content:center; font-size:1.25rem;">${esc(FLAG[ev.currency] || "")} ${esc(ev.title)}</h2>
+      <p style="font-size:1.6rem; margin:0.6rem 0;">🔒</p>
+      <p style="font-size:0.9rem; color:#d1d5db; margin-bottom:0.9rem;">The A&amp;M Research Desk projection and post-release decode for this event are unlocked per event. Your first event is free; after that each event is <strong>KSh ${esc(price)}</strong>, paid by M-Pesa.</p>
+      <button class="btn btn-publish" onclick="payForEvent('${esc(ev.event_id)}')">🔓 Unlock for KSh ${esc(price)} (M-Pesa)</button>
+      <button class="btn-outline" style="width:100%; margin-top:0.6rem;" onclick="payCheck('${esc(ev.event_id)}')">I've already paid — check again</button>
+      <p id="paymsg_${esc(ev.event_id)}" style="font-size:0.82rem; margin-top:0.6rem; color:var(--gold);"></p>
+    </div>`;
+  }
+
+  async function payForEvent(id) {
+    const msg = document.getElementById("paymsg_" + id);
+    msg.innerText = "Starting your payment...";
+    const { ok, data } = await apiPost("/api/pay/start", { event_id: id });
+    if (!ok) { msg.innerText = errText(data); return; }
+    if (data.already) { loadClientQueue(true); return; }
+    if (typeof data.authorization_url === "string" && data.authorization_url.indexOf("https://") === 0) {
+      msg.innerText = "Taking you to the secure payment page...";
+      window.location.href = data.authorization_url;
+    } else {
+      msg.innerText = "Could not open the payment page. Please try again.";
+    }
+  }
+
+  async function payCheck(id) {
+    const msg = document.getElementById("paymsg_" + id);
+    msg.innerText = "Checking your payment...";
+    const { ok, data } = await apiPost("/api/pay/check", { event_id: id });
+    if (!ok) { msg.innerText = errText(data); return; }
+    if (data.unlocked) { loadClientQueue(true); return; }
+    msg.innerText = data.checked ? "Your payment has not been confirmed yet. Please wait a minute and try again." : "We could not find a pending payment for this event. If you paid, contact support with your M-Pesa code.";
+  }
+
+  async function handlePayReturn() {
+    const banner = document.getElementById("payBanner");
+    try { window.history.replaceState({}, "", location.pathname); } catch (e) { /* ignore */ }
+    if (!banner) return;
+    banner.innerHTML = `<div class="card"><p style="color:var(--gold);">Confirming your payment...</p></div>`;
+    for (let i = 0; i < 6; i++) {
+      try {
+        const res = await fetch("/api/pay/verify?reference=" + encodeURIComponent(PAY_REF), { cache: "no-store" });
+        const d = res.ok ? await res.json() : null;
+        if (d && d.status === "SUCCESS") {
+          banner.innerHTML = `<div class="card" style="border-color:var(--gold);"><p style="color:var(--gold-bright); font-weight:700;">✅ Payment confirmed. This event is unlocked.</p></div>`;
+          loadClientQueue(true);
+          return;
+        }
+        if (d && d.status === "FAILED") {
+          banner.innerHTML = `<div class="card"><p style="color:var(--red);">The payment did not complete. You have not been charged for this event. Please try again.</p></div>`;
+          return;
+        }
+      } catch (e) { /* try again */ }
+      await new Promise(r => setTimeout(r, 8000));
+    }
+    banner.innerHTML = `<div class="card"><p style="color:var(--gold);">Your payment is still being confirmed. This page unlocks automatically once it is, or press "I've already paid" in a minute.</p></div>`;
+  }
+
+  // ---- admin Payments & Access card ----
+  function payAdminHtml() {
+    const keyList = TAB_ORDER.map(k => `<option value="${k}">`).join("");
+    return `<details class="card desk-only" id="payCard" style="border-color: var(--gold);" ontoggle="if (this.open) loadPayAdmin()">
+      <summary style="cursor:pointer; font-weight:800; color:var(--gold-bright);">💳 Payments &amp; Access (Admin Only)</summary>
+      <div id="payStatus" style="margin:0.8rem 0; font-size:0.85rem; color:var(--muted);">Loading...</div>
+      <div class="form-grid">
+        <div class="check-row"><input type="checkbox" id="payEnabled" /><label for="payEnabled" style="margin:0; color:var(--text); cursor:pointer;">Payments ON (clients must unlock each event)</label></div>
+        <div class="check-row"><input type="checkbox" id="payFree" /><label for="payFree" style="margin:0; color:var(--text); cursor:pointer;">First event free for every new account</label></div>
+        <div><label>Price per event (KSh)</label><input type="number" id="payPrice" step="10" /></div>
+      </div>
+      <div style="display:flex; gap:0.6rem; flex-wrap:wrap; margin-top:0.7rem;">
+        <button class="btn" onclick="savePayConfig()">💾 Save Payment Settings</button>
+        <button class="btn-outline" onclick="recheckPayments()">🔁 Re-check Pending</button>
+        <a class="btn-outline" href="/api/admin/payments.csv" style="text-decoration:none; display:inline-block; padding:0.55rem 1rem; border-radius:6px;">⬇️ Export CSV</a>
+        <button class="btn-outline" onclick="loadPayAdmin()">🔄 Refresh</button>
+      </div>
+      <p id="payMsg" style="font-size:0.8rem; margin-top:0.4rem; color:var(--gold);"></p>
+      <p id="paySummary" style="font-size:0.85rem; margin:0.8rem 0;"></p>
+      <div style="overflow-x:auto;"><table>
+        <thead><tr><th>Event</th><th>Paid</th><th>Free</th><th>Admin</th><th>Revenue (KSh)</th></tr></thead>
+        <tbody id="payByEvent"></tbody>
+      </table></div>
+      <h2 style="margin-top:1rem;"><span>✅ Manual Approval (backup or gift)</span></h2>
+      <div class="form-grid">
+        <div><label>Client email</label><input type="text" id="apEmail" /></div>
+        <div><label>Event</label><input type="text" id="apEvent" list="apEvents" placeholder="e.g. USD_NFP" /><datalist id="apEvents">${keyList}</datalist></div>
+        <div><label>Release date (optional, YYYY-MM-DD)</label><input type="text" id="apDate" placeholder="uses the queued event if blank" /></div>
+      </div>
+      <button class="btn-outline" style="margin-top:0.6rem;" onclick="approvePayment()">Approve Access</button>
+      <h2 style="margin-top:1rem;"><span>🧾 Recent Payments &amp; Unlocks</span></h2>
+      <div style="overflow-x:auto;"><table>
+        <thead><tr><th>When</th><th>Client</th><th>Event</th><th>Type</th><th>Status</th><th>KSh</th></tr></thead>
+        <tbody id="payRows"></tbody>
+      </table></div>
+      <h2 style="margin-top:1rem;"><span>🕵️ Abuse Review (sign-ups)</span></h2>
+      <p style="font-size:0.78rem; color:var(--muted); margin-bottom:0.5rem;">Accounts that share an email inbox, phone number or network, and free events that were refused. Review them yourself; nothing here blocks anyone automatically except the free event.</p>
+      <div style="overflow-x:auto;"><table>
+        <thead><tr><th>Flag</th><th>Detail</th><th>Accounts</th></tr></thead>
+        <tbody id="payReview"></tbody>
+      </table></div>
+    </details>`;
+  }
+
+  async function loadPayAdmin() {
+    const status = document.getElementById("payStatus");
+    if (!status) return;
+    try {
+      const [cr, pr] = await Promise.all([fetch("/api/admin/pay-config", { cache: "no-store" }), fetch("/api/admin/payments", { cache: "no-store" })]);
+      if (!cr.ok || !pr.ok) throw new Error("bad response");
+      const c = await cr.json();
+      const p = await pr.json();
+      document.getElementById("payEnabled").checked = c.config.enabled;
+      document.getElementById("payFree").checked = c.config.free_first_event;
+      document.getElementById("payPrice").value = c.config.price_kes;
+      status.innerHTML = `Paystack key: <strong>${c.secret_set ? "set (" + esc(c.mode) + " mode)" : "NOT SET in Render"}</strong> | Webhook secret: <strong>${c.webhook_secret_set ? "set" : "not set"}</strong><br>Webhook address to paste in your Paystack dashboard: <strong>${esc(c.webhook_url)}</strong>`;
+      const s = p.summary;
+      document.getElementById("paySummary").innerText = `Revenue: KSh ${Number(s.revenue_kes).toLocaleString()} | Paid unlocks: ${s.paid_count} | Free unlocks: ${s.free_count} | Admin approvals: ${s.admin_count} | Pending: ${s.pending}`;
+      const ev = Object.keys(s.by_event).sort().reverse();
+      document.getElementById("payByEvent").innerHTML = ev.length ? ev.map(k => { const b = s.by_event[k]; return `<tr><td>${esc(k)}</td><td>${b.paid}</td><td>${b.free}</td><td>${b.admin}</td><td>${Number(b.revenue_kes).toLocaleString()}</td></tr>`; }).join("")
+        : `<tr><td colspan="5" style="color:var(--muted);">No unlocks yet.</td></tr>`;
+      document.getElementById("payRows").innerHTML = p.payments.length ? p.payments.slice(0, 60).map(r =>
+        `<tr><td>${esc(fmtTime(r.created_at))}</td><td>${esc(r.email)}</td><td>${esc(r.event_key)}</td><td>${esc(r.method)}</td><td><span class="pill ${r.status === "SUCCESS" ? "hit" : r.status === "PENDING" ? "up" : "miss"}">${esc(r.status)}</span></td><td>${Number(r.amount_kes || 0).toLocaleString()}</td></tr>`).join("")
+        : `<tr><td colspan="6" style="color:var(--muted);">Nothing yet.</td></tr>`;
+      document.getElementById("payReview").innerHTML = p.review.length ? p.review.map(r =>
+        `<tr><td><span class="pill trap">${esc(r.kind)}</span></td><td style="font-size:0.8rem;">${esc(r.key)}</td><td style="font-size:0.8rem;">${esc(r.accounts.join(", "))}</td></tr>`).join("")
+        : `<tr><td colspan="3" style="color:var(--muted);">Nothing suspicious found.</td></tr>`;
+    } catch (e) {
+      status.innerText = "Could not load the payments data. Tap Refresh to try again.";
+    }
+  }
+
+  async function savePayConfig() {
+    const body = { enabled: document.getElementById("payEnabled").checked, free_first_event: document.getElementById("payFree").checked, price_kes: Number(document.getElementById("payPrice").value) };
+    if (body.enabled && !confirm("Turn payments ON? Clients will have to unlock every event after their free one.")) return;
+    const { ok, data } = await apiPost("/api/admin/pay-config", body);
+    document.getElementById("payMsg").innerText = ok ? "✅ Saved." : "Could not save: " + errText(data);
+    if (ok) loadPayAdmin();
+  }
+
+  async function approvePayment() {
+    const body = { email: document.getElementById("apEmail").value.trim(), event_id: document.getElementById("apEvent").value.trim().toUpperCase() };
+    const d = document.getElementById("apDate").value.trim();
+    if (d) body.release_date = d;
+    const { ok, data } = await apiPost("/api/admin/payments/approve", body);
+    document.getElementById("payMsg").innerText = ok ? "✅ Access granted for " + data.event_key : "Could not approve: " + errText(data);
+    if (ok) loadPayAdmin();
+  }
+
+  async function recheckPayments() {
+    const { ok, data } = await apiPost("/api/admin/payments/recheck", {});
+    document.getElementById("payMsg").innerText = ok ? `Checked ${data.checked} pending payment(s); unlocked ${data.unlocked}.` : "Could not re-check: " + errText(data);
+    if (ok) loadPayAdmin();
+  }
+
   // ---- one-time admin setup: new tabs, desk views, schedule panels, queue manager ----
   let v2Ready = false;
   function setupV2Desk() {
     if (v2Ready) return;
     v2Ready = true;
     const tabsBox = document.getElementById("tabsBox");
-    ["GBP_CPI", "GBP_JOBS", "EUR_CPI", "EUR_PMI"].forEach(k => {
+    ["GBP_CPI", "EUR_CPI", "EUR_PMI"].forEach(k => {
       tabsBox.insertAdjacentHTML("beforeend", `<button class="tab" id="tab${tabIdFor(k)}" onclick="switchTab('${k}')">${MODS[k].tabLabel}</button>`);
       document.getElementById("newViews").insertAdjacentHTML("beforeend", buildDeskView(k));
     });
+    const v3TabBtn = `<button class="tab" id="tab${tabIdFor("GBP_JOBS_V3")}" onclick="switchTab('GBP_JOBS_V3')">${MODS.GBP_JOBS_V3.tabLabel}</button>`;
+    const gbpCpiTab = document.getElementById("tab" + tabIdFor("GBP_CPI"));
+    if (gbpCpiTab) gbpCpiTab.insertAdjacentHTML("afterend", v3TabBtn); else tabsBox.insertAdjacentHTML("beforeend", v3TabBtn);
+    document.getElementById("newViews").insertAdjacentHTML("beforeend", buildJobsV3View());
+    // the jobs schedule/publish card lived in the retired V2 tab; it moves into the v3 tab
+    document.getElementById("gbpj3ScheduleHost").insertAdjacentHTML("beforeend", schedulePanelHtml("GBP_JOBS"));
     TAB_ORDER.forEach(k => {
+      if (k === "GBP_JOBS_V3") return;   // model terminal, not a publishable event type
       const host = document.getElementById(MODS[k].prefix + "DeskCard");
       if (host) host.insertAdjacentHTML("afterend", schedulePanelHtml(k));
     });
     document.getElementById("queueCard").insertAdjacentHTML("beforebegin", sheetHtml());
+    document.getElementById("queueCard").insertAdjacentHTML("beforebegin", payAdminHtml());
     document.getElementById("queueCard").insertAdjacentHTML("beforebegin", relLedgerHtml());
     document.getElementById("queueCard").insertAdjacentHTML("beforebegin", calibrationHtml());
+    v3Live();
+    v3Sync(false);
     document.getElementById("curFilter").innerHTML = ["ALL", "USD", "GBP", "EUR"].map(c =>
       `<button class="cur-chip${c === "ALL" ? " active" : ""}" data-cur="${c}" onclick="setCurFilter('${c}')">${FILTER_LABEL[c]}</button>`).join("");
   }
